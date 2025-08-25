@@ -1,4 +1,4 @@
-# app.py — Primitiva · Recomendador A2 (Google Sheets Live)
+# app.py — Primitiva · Recomendador A2 (Google Sheets Live, robusto)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -31,35 +31,64 @@ THRESH_N = [
   {"z":-999,  "n": 1},
 ]
 
+# ---------- helpers ----------
+def get_secret_key(name, group="gcp_service_account"):
+    """Devuelve un secret tanto si está en la raíz como dentro del bloque [gcp_service_account]."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+        if group in st.secrets and name in st.secrets[group]:
+            return st.secrets[group][name]
+    except Exception:
+        pass
+    return None
+
 # ---------------- Google Sheets Loader ----------------
 @st.cache_data(ttl=600, show_spinner=True)
 def load_sheet_df():
-    # 1) Credenciales desde Secrets
+    # 1) Credenciales (bloque gcp_service_account es obligatorio)
+    if "gcp_service_account" not in st.secrets:
+        st.error("No encuentro el bloque [gcp_service_account] en Secrets. Añádelo y pulsa Reboot.")
+        return pd.DataFrame()
+
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     gc = gspread.authorize(creds)
 
-    # 2) Abrir Sheet y Worksheet
-    sheet_id = st.secrets["sheet_id"]
-    ws_name  = st.secrets.get("worksheet_historico", "Historico")
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(ws_name)
+    # 2) sheet_id / worksheet: acepta raíz o dentro del bloque
+    sheet_id = get_secret_key("sheet_id")
+    ws_name  = get_secret_key("worksheet_historico") or "Historico"
+    if not sheet_id:
+        st.error(
+            "No encuentro `sheet_id` en Secrets.\n\n"
+            "En Settings → Secrets añade (fuera de [gcp_service_account]):\n"
+            'sheet_id = "TU_SHEET_ID"\nworksheet_historico = "Historico"\n'
+            "Guarda y pulsa Reboot."
+        )
+        return pd.DataFrame()
 
-    # 3) A DataFrame
+    # 3) Leer hoja
+    try:
+        sh = gc.open_by_key(sheet_id)
+        ws = sh.worksheet(ws_name)
+    except Exception as e:
+        st.error(f"No puedo abrir el Sheet/Worksheet. Revisa `sheet_id` y `worksheet_historico`. Detalle: {e}")
+        return pd.DataFrame()
+
     rows = ws.get_all_records(numericise_ignore=["FECHA"])
     df = pd.DataFrame(rows)
 
-    # 4) Normalización
     expected = ["FECHA","N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]
     missing = [c for c in expected if c not in df.columns]
     if missing:
-        st.error(f"Faltan columnas en el Sheet: {missing}")
+        st.error(f"Faltan columnas en la hoja: {missing}")
         return pd.DataFrame(columns=expected)
 
     df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
     df = df.dropna(subset=["FECHA"]).sort_values("FECHA").reset_index(drop=True)
     for c in ["N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 # ---------------- Utilidades modelo ----------------
@@ -170,16 +199,15 @@ def has_duplicate_row(df, last_dt, nums, comp, rein):
 # ---------------- Carga desde Google Sheets ----------------
 df_hist = load_sheet_df()
 if df_hist.empty:
-    st.error("No se pudieron cargar datos desde Google Sheets. Revisa Secrets, permisos y nombres (sheet_id / worksheet_historico).")
     st.stop()
 
-# ---------------- Sidebar (solo parámetros de control) ----------------
+# ---------------- Sidebar (parámetros) ----------------
 with st.sidebar:
     bank = st.number_input("Banco disponible (€)", min_value=0, value=10, step=1)
     vol  = st.selectbox("Volatilidad objetivo", ["Low","Medium","High"], index=1,
                         help="Low: conservador · Medium: estándar · High: agresivo")
 
-# ---------------- Formulario de entrada ----------------
+# ---------------- Formulario ----------------
 with st.form("entrada"):
     c1, c2 = st.columns(2)
     last_date = c1.date_input("Fecha último sorteo (Lun/Jue/Sáb)", value=pd.Timestamp.today().date())
@@ -207,17 +235,15 @@ if do_calc:
 
     st.info(f"Próximo sorteo: **{next_dt.date().strftime('%d/%m/%Y')}** ({next_dayname})")
 
-    # Filtrar histórico hasta last_dt
     base = df_hist.copy()
     base = base[base["FECHA"] <= last_dt].sort_values("FECHA")
 
-    # Anti-duplicados
     has_date, full_match = has_duplicate_row(base, last_dt, nums, comp, rein)
     if has_date and full_match:
         st.success("✅ Sorteo ya existe en el histórico con la misma combinación. No se añade (antiduplicado).")
         df_recent = base.tail(WINDOW_DRAWS)
     elif has_date and not full_match:
-        st.warning("⚠️ Hay un sorteo con la misma fecha pero combinación distinta en el Sheet. Uso el Sheet (no añado la nueva). Revisa tu histórico.")
+        st.warning("⚠️ Misma fecha con combinación distinta en el Sheet. Uso el Sheet (no añado la nueva). Revisa tu histórico.")
         df_recent = base.tail(WINDOW_DRAWS)
     else:
         row_now = pd.DataFrame([{
@@ -229,18 +255,13 @@ if do_calc:
 
     df_recent["weekday"] = df_recent["FECHA"].dt.weekday
 
-    # Pesos
     w_glob = weighted_counts_nums(df_recent, last_dt)
     w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
     w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
-    # A1 del próximo día
     A1 = A1_FIJAS.get(next_dayname, [4,24,35,37,40,46])
 
-    # Candidatos A2
-    cands = []
-    seen = set()
-    tries = 0
+    cands, seen, tries = [], set(), 0
     while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*50:
         c = tuple(random_combo()); tries += 1
         if c in seen: continue
@@ -251,23 +272,18 @@ if do_calc:
     cands = sorted(cands, key=lambda c: score_combo(c, w_blend), reverse=True)
     pool = cands[:1000]
 
-    # Señal y n
     bestA2 = list(pool[0]) if pool else []
     zA2 = zscore_combo(bestA2, w_blend) if bestA2 else 0.0
-    n = pick_n(zA2, bank, vol)
-    n = max(1, min(6, n))
+    n = pick_n(zA2, bank, vol); n = max(1, min(6, n))
     A2s = greedy_select(pool, w_blend, max(0, n-1))
 
-    # Reintegro sugerido (informativo)
     wr_glob = weighted_counts_rei(df_recent, last_dt)
     wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
     rei_scores = {r: DAY_BLEND_ALPHA*wr_day.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob.get(r,0.0) for r in range(10)}
     rein_sug = max(rei_scores, key=lambda r: rei_scores[r]) if rei_scores else 0
 
-    # Joker (señal)
     joker = (zA2 >= 0.35) and (bank >= n+1) and (vol!="Low")
 
-    # Salida
     st.subheader("Resultados")
     st.write(f"**A1 (fija)** {A1}  |  **n recomendado:** {n}")
     for i, c in enumerate(A2s, start=1):
