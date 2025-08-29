@@ -88,7 +88,7 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str
         return pd.DataFrame()
 
     creds = get_gcp_credentials()
-    gc = gspread.authorize(creds)   # 👈 esta línea debe ir con la misma sangría que la anterior
+    gc = gspread.authorize(creds)   # 👈 importante: misma sangría
 
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
@@ -423,10 +423,10 @@ with tab_bono:
         A1b = A1_FIJAS_BONO.get((weekday+1) % 7, [4,24,35,37,40,46])
 
         # Candidatos
-        def score_combo_b(c, w): 
+        def score_combo_b(c, w):
             return sum(np.log(w.get(n,0.0)+ALPHA_DIR) for n in c) - MU_PENALTY*popularity_penalty(c)
-        def terciles_ok_b(c): 
-            return any(1<=x<=16 for x in c) and any(17<=x<=32 for x in c) and any(33<=x<=49 for x in c)
+        def terciles_ok_b(c):
+            return any(1<=x<=16 for x in c) and any(17<=x<=32 for x en c) and any(33<=x<=49 for x in c)
         def overlap_ratio_b(a,b): return len(set(a)&set(b))/6.0
 
         cands_b, seen_b, tries_b = [], set(), 0
