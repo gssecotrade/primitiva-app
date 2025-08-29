@@ -6,6 +6,7 @@ from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
 
+# ---------------- Credenciales (normaliza private_key) ----------------
 def get_gcp_credentials():
     """
     Normaliza la private_key de los Secrets (sirve si viene con '\n' o con saltos reales)
@@ -15,7 +16,6 @@ def get_gcp_credentials():
         raise RuntimeError("Falta [gcp_service_account] en Secrets.")
     info = dict(st.secrets["gcp_service_account"])
     pk = info.get("private_key", "")
-    # Si la clave viene en una sola línea con '\n', convierto a saltos reales.
     if isinstance(pk, str) and "\\n" in pk:
         info["private_key"] = pk.replace("\\n", "\n")
     info["private_key"] = info["private_key"].strip()
@@ -45,18 +45,22 @@ THRESH_N = [
 ]
 
 # A1 fijas por día para PRIMITIVA
-A1_FIJAS_PRIMI = {"Monday":[4,24,35,37,40,46], "Thursday":[1,10,23,39,45,48], "Saturday":[7,12,14,25,29,40]}
+A1_FIJAS_PRIMI = {
+    "Monday":[4,24,35,37,40,46],
+    "Thursday":[1,10,23,39,45,48],
+    "Saturday":[7,12,14,25,29,40]
+}
 REIN_FIJOS_PRIMI = {"Monday":1, "Thursday":8, "Saturday":0}
 
-# A1 neutras iniciales por día para BONOLOTO (se pueden calibrar tras 8–12 semanas)
+# A1 neutras iniciales por día para BONOLOTO (se calibrarán tras 8–12 semanas)
 A1_FIJAS_BONO = {
-    0: [4,24,35,37,40,46],  # Monday
-    1: [4,24,35,37,40,46],  # Tuesday
-    2: [4,24,35,37,40,46],  # Wednesday
-    3: [4,24,35,37,40,46],  # Thursday
-    4: [4,24,35,37,40,46],  # Friday
-    5: [4,24,35,37,40,46],  # Saturday
-    6: [4,24,35,37,40,46],  # Sunday
+    0:[4,24,35,37,40,46],  # Mon
+    1:[4,24,35,37,40,46],  # Tue
+    2:[4,24,35,37,40,46],  # Wed
+    3:[4,24,35,37,40,46],  # Thu
+    4:[4,24,35,37,40,46],  # Fri
+    5:[4,24,35,37,40,46],  # Sat
+    6:[4,24,35,37,40,46],  # Sun
 }
 
 # ---------------- Helpers de secrets ----------------
@@ -84,7 +88,7 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str
         return pd.DataFrame()
 
     creds = get_gcp_credentials()
-gc = gspread.authorize(creds)
+    gc = gspread.authorize(creds)   # 👈 esta línea debe ir con la misma sangría que la anterior
 
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
@@ -195,8 +199,10 @@ def greedy_select(pool, weights, n):
         selected.append(bestC)
     return selected
 
-def to_js_day(dayname):
-    return 1 if dayname=="Monday" else 4 if dayname=="Thursday" else 6 if dayname=="Saturday" else -1
+# Mapea nombre de día a weekday de Python (Monday=0, Thursday=3, Saturday=5)
+def weekday_from_name(dayname: str) -> int:
+    mapping = {"Monday":0, "Tuesday":1, "Wednesday":2, "Thursday":3, "Friday":4, "Saturday":5, "Sunday":6}
+    return mapping.get(dayname, -1)
 
 # ---------------- Pestañas ----------------
 tab_primi, tab_bono = st.tabs(["La Primitiva", "Bonoloto"])
@@ -230,7 +236,6 @@ with tab_primi:
         nums = [cols[i].number_input(f"N{i+1}", 1, 49, defaults[i], 1, key=f"npr{i+1}") for i in range(6)]
         do_calc = st.form_submit_button("Calcular recomendaciones · Primitiva")
 
-    # Cálculo
     if do_calc:
         if len(set(nums)) != 6:
             st.error("Los 6 números deben ser distintos.")
@@ -238,10 +243,14 @@ with tab_primi:
 
         last_dt = pd.to_datetime(last_date)
         wd = last_dt.weekday()  # 0=Mon..6=Sun
+
         # Próximo sorteo en Primitiva (Lun→Jue, Jue→Sáb, Sáb→Lun)
-        if wd==0: next_dt, next_dayname = last_dt + pd.Timedelta(days=3), "Thursday"
-        elif wd==3: next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Saturday"
-        elif wd==5: next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Monday"
+        if wd == 0:
+            next_dt, next_dayname = last_dt + pd.Timedelta(days=3), "Thursday"
+        elif wd == 3:
+            next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Saturday"
+        elif wd == 5:
+            next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Monday"
         else:
             st.error("La fecha debe ser Lunes, Jueves o Sábado.")
             st.stop()
@@ -283,7 +292,8 @@ with tab_primi:
         df_recent["weekday"] = df_recent["FECHA"].dt.weekday
 
         w_glob = weighted_counts_nums(df_recent, last_dt)
-        w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
+        next_wd = weekday_from_name(next_dayname)  # 0..6
+        w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==next_wd], last_dt)
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
         A1 = A1_FIJAS_PRIMI.get(next_dayname, [4,24,35,37,40,46])
@@ -306,7 +316,7 @@ with tab_primi:
         A2s = greedy_select(pool, w_blend, max(0, n-1))
 
         wr_glob = weighted_counts_rei(df_recent, last_dt)
-        wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
+        wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==next_wd], last_dt)
         rei_scores = {r: DAY_BLEND_ALPHA*wr_day.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob.get(r,0.0) for r in range(10)}
         rein_sug = max(rei_scores, key=lambda r: rei_scores[r]) if rei_scores else 0
 
@@ -357,10 +367,8 @@ with tab_bono:
         cols = st.columns(6)
         defaults_b = [5,6,8,23,46,47]
         nums_b = [cols[i].number_input(f"N{i+1} (Bono)", 1, 49, defaults_b[i], 1, key=f"nbo{i+1}") for i in range(6)]
-
         do_calc_b = st.form_submit_button("Calcular recomendaciones · Bonoloto")
 
-    # Cálculo Bonoloto
     if do_calc_b:
         if len(set(nums_b)) != 6:
             st.error("Los 6 números deben ser distintos.")
@@ -368,7 +376,7 @@ with tab_bono:
 
         last_dt_b = pd.to_datetime(last_date_b)
         weekday = last_dt_b.weekday()  # 0=Mon..6=Sun
-        next_dt_b = last_dt_b + pd.Timedelta(days=1)  # aproximación general (Bonoloto sortea a diario)
+        next_dt_b = last_dt_b + pd.Timedelta(days=1)  # aproximación general
         next_dayname_b = next_dt_b.day_name()
 
         st.info(f"Próximo sorteo (aprox.): **{next_dt_b.date().strftime('%d/%m/%Y')}** ({next_dayname_b})")
@@ -450,8 +458,7 @@ with tab_bono:
                     return max(1, n)
             return 1
 
-        n_b = pick_n_b(zA2_b, bank_b, vol_b)
-        n_b = max(1, min(6, n_b))
+        n_b = max(1, min(6, pick_n_b(zA2_b, bank_b, vol_b)))
 
         def greedy_select_b(pool,w,n):
             if n<=0: return []
