@@ -88,7 +88,7 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str
         return pd.DataFrame()
 
     creds = get_gcp_credentials()
-    gc = gspread.authorize(creds)   # 👈 importante: misma sangría
+    gc = gspread.authorize(creds)
 
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
@@ -199,7 +199,6 @@ def greedy_select(pool, weights, n):
         selected.append(bestC)
     return selected
 
-# Mapea nombre de día a weekday de Python (Monday=0, Thursday=3, Saturday=5)
 def weekday_from_name(dayname: str) -> int:
     mapping = {"Monday":0, "Tuesday":1, "Wednesday":2, "Thursday":3, "Friday":4, "Saturday":5, "Sunday":6}
     return mapping.get(dayname, -1)
@@ -212,18 +211,15 @@ with tab_primi:
     st.subheader("La Primitiva · Recomendador A2")
     st.caption("A1 fija por día · A2 dinámica · Joker opcional")
 
-    # Carga histórico
     df_hist = load_sheet_df_primi()
     if df_hist.empty:
         st.stop()
 
-    # Sidebar (parámetros)
     with st.sidebar:
         bank = st.number_input("Banco disponible (€)", min_value=0, value=10, step=1, key="bank_primi")
         vol  = st.selectbox("Volatilidad objetivo", ["Low","Medium","High"], index=1, key="vol_primi",
                             help="Low: conservador · Medium: estándar · High: agresivo")
 
-    # Formulario
     with st.form("entrada_primi"):
         c1, c2 = st.columns(2)
         last_date = c1.date_input("Fecha último sorteo (Lun/Jue/Sáb)", value=pd.Timestamp.today().date())
@@ -242,9 +238,8 @@ with tab_primi:
             st.stop()
 
         last_dt = pd.to_datetime(last_date)
-        wd = last_dt.weekday()  # 0=Mon..6=Sun
+        wd = last_dt.weekday()
 
-        # Próximo sorteo en Primitiva (Lun→Jue, Jue→Sáb, Sáb→Lun)
         if wd == 0:
             next_dt, next_dayname = last_dt + pd.Timedelta(days=3), "Thursday"
         elif wd == 3:
@@ -259,7 +254,6 @@ with tab_primi:
 
         base = df_hist[df_hist["FECHA"] <= last_dt].sort_values("FECHA").copy()
 
-        # Antiduplicados
         def has_duplicate_row(df, last_dt, nums, comp, rein):
             if df.empty: return False, False
             same_date = df["FECHA"].dt.date == last_dt.date()
@@ -292,13 +286,12 @@ with tab_primi:
         df_recent["weekday"] = df_recent["FECHA"].dt.weekday
 
         w_glob = weighted_counts_nums(df_recent, last_dt)
-        next_wd = weekday_from_name(next_dayname)  # 0..6
+        next_wd = weekday_from_name(next_dayname)
         w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==next_wd], last_dt)
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
         A1 = A1_FIJAS_PRIMI.get(next_dayname, [4,24,35,37,40,46])
 
-        # Candidatos A2
         cands, seen, tries = [], set(), 0
         while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*50:
             c = tuple(random_combo()); tries += 1
@@ -344,19 +337,16 @@ with tab_bono:
     st.subheader("Bonoloto · Recomendador A2")
     st.caption("A1 ancla inicial por día · A2 dinámica · sin Joker")
 
-    # Carga histórico Bonoloto
     df_bono = load_sheet_df_generic("sheet_id_bono", "worksheet_historico_bono", "HistoricoBono")
     if df_bono.empty:
         st.stop()
 
-    # Sidebar Bonoloto
     with st.sidebar:
         st.markdown("---")
         st.markdown("**Bonoloto** · Parámetros")
         bank_b = st.number_input("Banco (€) · Bonoloto", min_value=0, value=10, step=1, key="bank_bono")
         vol_b  = st.selectbox("Volatilidad · Bonoloto", ["Low","Medium","High"], index=1, key="vol_bono")
 
-    # Formulario Bonoloto
     with st.form("entrada_bono"):
         c1, c2 = st.columns(2)
         last_date_b = c1.date_input("Fecha último sorteo (Bonoloto)", value=pd.Timestamp.today().date())
@@ -375,7 +365,7 @@ with tab_bono:
             st.stop()
 
         last_dt_b = pd.to_datetime(last_date_b)
-        weekday = last_dt_b.weekday()  # 0=Mon..6=Sun
+        weekday = last_dt_b.weekday()
         next_dt_b = last_dt_b + pd.Timedelta(days=1)  # aproximación general
         next_dayname_b = next_dt_b.day_name()
 
@@ -383,7 +373,6 @@ with tab_bono:
 
         base_b = df_bono[df_bono["FECHA"] <= last_dt_b].sort_values("FECHA").copy()
 
-        # Antiduplicados
         def has_dup(df, last_dt, nums, comp, rein):
             if df.empty: return False, False
             same = df["FECHA"].dt.date == last_dt.date()
@@ -413,21 +402,21 @@ with tab_bono:
             }])
             df_recent_b = pd.concat([base_b, row_now_b], ignore_index=True).sort_values("FECHA").tail(WINDOW_DRAWS)
 
-        # Pesos
         df_recent_b["weekday"] = df_recent_b["FECHA"].dt.weekday
         w_glob_b = weighted_counts_nums(df_recent_b, last_dt_b)
         w_day_b  = weighted_counts_nums(df_recent_b[df_recent_b["weekday"]==weekday], last_dt_b)
         w_blend_b = blend(w_day_b, w_glob_b, alpha=DAY_BLEND_ALPHA)
 
-        # A1 (ancla inicial por día)
         A1b = A1_FIJAS_BONO.get((weekday+1) % 7, [4,24,35,37,40,46])
 
-        # Candidatos
         def score_combo_b(c, w):
             return sum(np.log(w.get(n,0.0)+ALPHA_DIR) for n in c) - MU_PENALTY*popularity_penalty(c)
+
         def terciles_ok_b(c):
-            return any(1<=x<=16 for x in c) and any(17<=x<=32 for x en c) and any(33<=x<=49 for x in c)
-        def overlap_ratio_b(a,b): return len(set(a)&set(b))/6.0
+            return any(1 <= x <= 16 for x in c) and any(17 <= x <= 32 for x in c) and any(33 <= x <= 49 for x in c)
+
+        def overlap_ratio_b(a,b): 
+            return len(set(a)&set(b))/6.0
 
         cands_b, seen_b, tries_b = [], set(), 0
         while len(cands_b)<K_CANDIDATOS and tries_b < K_CANDIDATOS*50:
@@ -440,7 +429,6 @@ with tab_bono:
         cands_b = sorted(cands_b, key=lambda c: score_combo_b(c, w_blend_b), reverse=True)
         pool_b = cands_b[:1000]
 
-        # Señal y n
         def zscore_combo_b(c, w):
             allW = np.array([w.get(i,0.0) for i in range(1,50)])
             m=float(allW.mean()); sd=float(allW.std()) if allW.std()!=0 else 1e-6
@@ -477,13 +465,11 @@ with tab_bono:
 
         A2s_b = greedy_select_b(pool_b, w_blend_b, max(0, n_b-1))
 
-        # Reintegro sugerido (informativo)
         wr_glob_b = weighted_counts_rei(df_recent_b, last_dt_b)
         wr_day_b  = weighted_counts_rei(df_recent_b[df_recent_b["weekday"]==weekday], last_dt_b)
         rei_scores_b = {r: DAY_BLEND_ALPHA*wr_day_b.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob_b.get(r,0.0) for r in range(10)}
         rein_sug_b = max(rei_scores_b, key=lambda r: rei_scores_b[r]) if rei_scores_b else 0
 
-        # Salida
         st.subheader("Resultados · Bonoloto")
         st.write(f"**A1 (ancla inicial)** {A1b}  |  **n recomendado:** {n_b}")
         for i, c in enumerate(A2s_b, start=1):
