@@ -6,6 +6,22 @@ from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
 
+def get_gcp_credentials():
+    """
+    Normaliza la private_key de los Secrets (sirve si viene con '\n' o con saltos reales)
+    y devuelve las credenciales listas para usar con Google Sheets.
+    """
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Falta [gcp_service_account] en Secrets.")
+    info = dict(st.secrets["gcp_service_account"])
+    pk = info.get("private_key", "")
+    # Si la clave viene en una sola línea con '\n', convierto a saltos reales.
+    if isinstance(pk, str) and "\\n" in pk:
+        info["private_key"] = pk.replace("\\n", "\n")
+    info["private_key"] = info["private_key"].strip()
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
 # ---------------- Page ----------------
 st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="centered")
 st.title("🎯 Primitiva & Bonoloto · Recomendador A2 (n dinámico)")
@@ -67,9 +83,8 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str
         st.error("No encuentro [gcp_service_account] en Secrets. Añádelo y pulsa Reboot.")
         return pd.DataFrame()
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-    gc = gspread.authorize(creds)
+    creds = get_gcp_credentials()
+gc = gspread.authorize(creds)
 
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
