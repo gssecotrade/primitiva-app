@@ -1,6 +1,5 @@
-
-streamlit==1.36.0
+streamlit==1.37.1
 pandas==2.2.2
 numpy==1.26.4
 gspread==6.1.2
-google-auth==2.30.0
+google-auth==2.33.0
