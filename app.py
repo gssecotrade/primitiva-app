@@ -1,4 +1,6 @@
 # app.py — Primitiva & Bonoloto · Recomendador A2 (Google Sheets Live, robusto)
+
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,10 +8,7 @@ from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ---------------- Credenciales (normaliza private_key) ----------------
-import json
-from google.oauth2.service_account import Credentials
-
+# ---------------- Credenciales (acepta gcp_json o gcp_service_account) ----------------
 def get_gcp_credentials():
     """
     Lee primero el secreto 'gcp_json' (JSON completo). Si no existe, intenta el bloque [gcp_service_account].
@@ -17,7 +16,7 @@ def get_gcp_credentials():
     """
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-    # Ruta A: JSON completo en secrets (recomendada)
+    # Ruta A (recomendada): JSON completo en secrets
     if "gcp_json" in st.secrets:
         data = json.loads(st.secrets["gcp_json"])
         return Credentials.from_service_account_info(data, scopes=scopes)
@@ -31,7 +30,6 @@ def get_gcp_credentials():
         info["private_key"] = pk.replace("\\n", "\n")
     info["private_key"] = info["private_key"].strip()
     return Credentials.from_service_account_info(info, scopes=scopes)
-
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="centered")
@@ -64,11 +62,14 @@ A1_FIJAS_PRIMI = {
 REIN_FIJOS_PRIMI = {"Monday":1, "Thursday":8, "Saturday":0}
 
 # A1 neutras iniciales por día para BONOLOTO
-A1_FIJAS_BONO = {0:[4,24,35,37,40,46],1:[4,24,35,37,40,46],2:[4,24,35,37,40,46],
-                 3:[4,24,35,37,40,46],4:[4,24,35,37,40,46],5:[4,24,35,37,40,46],6:[4,24,35,37,40,46]}
+A1_FIJAS_BONO = {
+    0:[4,24,35,37,40,46], 1:[4,24,35,37,40,46], 2:[4,24,35,37,40,46],
+    3:[4,24,35,37,40,46], 4:[4,24,35,37,40,46], 5:[4,24,35,37,40,46], 6:[4,24,35,37,40,46]
+}
 
 # ---------------- Helpers de secrets ----------------
 def get_secret_key(name, group="gcp_service_account"):
+    """Devuelve un secret tanto si está en la raíz como dentro del bloque [gcp_service_account]."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -84,8 +85,15 @@ def load_sheet_df_primi():
     return load_sheet_df_generic("sheet_id", "worksheet_historico", "Historico")
 
 def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str):
-    if "gcp_service_account" not in st.secrets:
-        st.error("❌ Falta el bloque [gcp_service_account] en Settings → Secrets.")
+    """
+    Lee un DataFrame desde Google Sheets usando credenciales de Secrets.
+    Acepta dos formatos de credencial:
+      - st.secrets["gcp_json"]  (JSON completo pegado como string)
+      - st.secrets["gcp_service_account"] (bloque por campos)
+    """
+    # Aceptar cualquiera de las dos rutas
+    if ("gcp_json" not in st.secrets) and ("gcp_service_account" not in st.secrets):
+        st.error("❌ Falta 'gcp_json' o el bloque [gcp_service_account] en Settings → Secrets.")
         return pd.DataFrame()
 
     # Credenciales con diagnóstico claro
@@ -93,9 +101,9 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str
         creds = get_gcp_credentials()
     except Exception as e:
         st.error(
-            "❌ La clave de servicio de Google está mal formateada en Secrets.\n"
-            "Usa la `private_key` en **una sola línea** con `\\n` (como en el bloque que te pasé).\n"
-            f"Detalle técnico: {type(e).__name__}"
+            "❌ No puedo construir las credenciales de Google a partir de Secrets.\n"
+            "Si usas gcp_json, asegúrate de haber pegado el JSON completo entre comillas triples.\n"
+            f"Detalle técnico: {type(e).__name__}: {e}"
         )
         return pd.DataFrame()
 
@@ -261,6 +269,7 @@ with tab_primi:
         last_dt = pd.to_datetime(last_date)
         wd = last_dt.weekday()
 
+        # Próximo sorteo: Lun→Jue, Jue→Sáb, Sáb→Lun
         if wd == 0:
             next_dt, next_dayname = last_dt + pd.Timedelta(days=3), "Thursday"
         elif wd == 3:
@@ -275,6 +284,7 @@ with tab_primi:
 
         base = df_hist[df_hist["FECHA"] <= last_dt].sort_values("FECHA").copy()
 
+        # Antiduplicados
         def has_duplicate_row(df, last_dt, nums, comp, rein):
             if df.empty: return False, False
             same_date = df["FECHA"].dt.date == last_dt.date()
@@ -313,6 +323,7 @@ with tab_primi:
 
         A1 = A1_FIJAS_PRIMI.get(next_dayname, [4,24,35,37,40,46])
 
+        # Candidatos A2
         cands, seen, tries = [], set(), 0
         while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*50:
             c = tuple(random_combo()); tries += 1
@@ -393,6 +404,7 @@ with tab_bono:
 
         base_b = df_bono[df_bono["FECHA"] <= last_dt_b].sort_values("FECHA").copy()
 
+        # Antiduplicados
         def has_dup(df, last_dt, nums, comp, rein):
             if df.empty: return False, False
             same = df["FECHA"].dt.date == last_dt.date()
