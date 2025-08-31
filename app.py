@@ -8,10 +8,6 @@ from google.oauth2.service_account import Credentials
 
 # ---------------- Credenciales (normaliza private_key) ----------------
 def get_gcp_credentials():
-    """
-    Normaliza la private_key de los Secrets (sirve si viene con '\n' o con saltos reales)
-    y devuelve las credenciales listas para usar con Google Sheets.
-    """
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("Falta [gcp_service_account] en Secrets.")
     info = dict(st.secrets["gcp_service_account"])
@@ -52,20 +48,12 @@ A1_FIJAS_PRIMI = {
 }
 REIN_FIJOS_PRIMI = {"Monday":1, "Thursday":8, "Saturday":0}
 
-# A1 neutras iniciales por día para BONOLOTO (se calibrarán tras 8–12 semanas)
-A1_FIJAS_BONO = {
-    0:[4,24,35,37,40,46],  # Mon
-    1:[4,24,35,37,40,46],  # Tue
-    2:[4,24,35,37,40,46],  # Wed
-    3:[4,24,35,37,40,46],  # Thu
-    4:[4,24,35,37,40,46],  # Fri
-    5:[4,24,35,37,40,46],  # Sat
-    6:[4,24,35,37,40,46],  # Sun
-}
+# A1 neutras iniciales por día para BONOLOTO
+A1_FIJAS_BONO = {0:[4,24,35,37,40,46],1:[4,24,35,37,40,46],2:[4,24,35,37,40,46],
+                 3:[4,24,35,37,40,46],4:[4,24,35,37,40,46],5:[4,24,35,37,40,46],6:[4,24,35,37,40,46]}
 
 # ---------------- Helpers de secrets ----------------
 def get_secret_key(name, group="gcp_service_account"):
-    """Devuelve un secret tanto si está en la raíz como dentro del bloque [gcp_service_account]."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -75,51 +63,71 @@ def get_secret_key(name, group="gcp_service_account"):
         pass
     return None
 
-# ---------------- Lectura Google Sheets ----------------
+# ---------------- Lectura Google Sheets (con diagnóstico claro) ----------------
 @st.cache_data(ttl=600, show_spinner=True)
 def load_sheet_df_primi():
-    """Carga PRIMITIVA desde Google Sheets usando keys: sheet_id / worksheet_historico."""
     return load_sheet_df_generic("sheet_id", "worksheet_historico", "Historico")
 
 def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str):
-    """Lee un DataFrame desde Google Sheets usando claves de secrets."""
     if "gcp_service_account" not in st.secrets:
-        st.error("No encuentro [gcp_service_account] en Secrets. Añádelo y pulsa Reboot.")
+        st.error("❌ Falta el bloque [gcp_service_account] en Settings → Secrets.")
         return pd.DataFrame()
 
-    creds = get_gcp_credentials()
-    gc = gspread.authorize(creds)
+    # Credenciales con diagnóstico claro
+    try:
+        creds = get_gcp_credentials()
+    except Exception as e:
+        st.error(
+            "❌ La clave de servicio de Google está mal formateada en Secrets.\n"
+            "Usa la `private_key` en **una sola línea** con `\\n` (como en el bloque que te pasé).\n"
+            f"Detalle técnico: {type(e).__name__}"
+        )
+        return pd.DataFrame()
 
+    # Autorizar gspread
+    try:
+        gc = gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"❌ No puedo autorizar gspread con esas credenciales. Detalle: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+    # Leer IDs de Secrets
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
     if not sid:
         st.error(
-            f"No encuentro `{sheet_id_key}` en Secrets.\n\n"
-            f"Añade en Settings → Secrets:\n{sheet_id_key} = \"TU_SHEET_ID\"\n{worksheet_key} = \"{default_ws}\"\n"
-            "Guarda y pulsa Reboot."
+            f"❌ No encuentro `{sheet_id_key}` en Secrets.\n"
+            f"Añade:\n{sheet_id_key} = \"TU_SHEET_ID\"\n{worksheet_key} = \"{default_ws}\""
         )
         return pd.DataFrame()
 
+    # Abrir hoja y worksheet
     try:
         sh = gc.open_by_key(sid)
         ws = sh.worksheet(wsn)
     except Exception as e:
-        st.error(f"No puedo abrir el Sheet/Worksheet ({sheet_id_key}/{worksheet_key}). Detalle: {e}")
+        st.error(f"❌ No puedo abrir el Sheet/Worksheet ({sheet_id_key}/{worksheet_key}). Detalle: {e}")
         return pd.DataFrame()
 
-    rows = ws.get_all_records(numericise_ignore=["FECHA"])
-    df = pd.DataFrame(rows)
+    # Descargar y validar
+    try:
+        rows = ws.get_all_records(numericise_ignore=["FECHA"])
+        df = pd.DataFrame(rows)
+    except Exception as e:
+        st.error(f"❌ Error leyendo registros del Sheet. Detalle: {e}")
+        return pd.DataFrame()
 
     expected = ["FECHA","N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]
     missing = [c for c in expected if c not in df.columns]
     if missing:
-        st.error(f"Faltan columnas en la pestaña '{wsn}': {missing}")
+        st.error(f"❌ Faltan columnas en la pestaña '{wsn}': {missing}")
         return pd.DataFrame(columns=expected)
 
     df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
     df = df.dropna(subset=["FECHA"]).sort_values("FECHA").reset_index(drop=True)
     for c in ["N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 # ---------------- Utilidades de modelo ----------------
@@ -217,15 +225,13 @@ with tab_primi:
 
     with st.sidebar:
         bank = st.number_input("Banco disponible (€)", min_value=0, value=10, step=1, key="bank_primi")
-        vol  = st.selectbox("Volatilidad objetivo", ["Low","Medium","High"], index=1, key="vol_primi",
-                            help="Low: conservador · Medium: estándar · High: agresivo")
+        vol  = st.selectbox("Volatilidad objetivo", ["Low","Medium","High"], index=1, key="vol_primi")
 
     with st.form("entrada_primi"):
         c1, c2 = st.columns(2)
         last_date = c1.date_input("Fecha último sorteo (Lun/Jue/Sáb)", value=pd.Timestamp.today().date())
         rein = c2.number_input("Reintegro", min_value=0, max_value=9, value=2, step=1)
         comp = c2.number_input("Complementario", min_value=1, max_value=49, value=18, step=1)
-
         st.markdown("**Números extraídos (6 distintos)**")
         cols = st.columns(6)
         defaults = [5,6,8,23,46,47]
@@ -270,10 +276,10 @@ with tab_primi:
 
         has_date, full_match = has_duplicate_row(base, last_dt, nums, comp, rein)
         if has_date and full_match:
-            st.success("✅ Sorteo ya existe en el histórico con la misma combinación. No se añade (antiduplicado).")
+            st.success("✅ Sorteo ya existe en el histórico con la misma combinación. No se añade.")
             df_recent = base.tail(WINDOW_DRAWS)
         elif has_date and not full_match:
-            st.warning("⚠️ Misma fecha con combinación distinta en el Sheet. Uso el Sheet (no añado la nueva).")
+            st.warning("⚠️ Misma fecha con combinación distinta en el Sheet. Uso el Sheet (no añado).")
             df_recent = base.tail(WINDOW_DRAWS)
         else:
             row_now = pd.DataFrame([{
@@ -286,7 +292,7 @@ with tab_primi:
         df_recent["weekday"] = df_recent["FECHA"].dt.weekday
 
         w_glob = weighted_counts_nums(df_recent, last_dt)
-        next_wd = weekday_from_name(next_dayname)
+        next_wd = {"Monday":0,"Thursday":3,"Saturday":5}[next_dayname]
         w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==next_wd], last_dt)
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
@@ -305,7 +311,7 @@ with tab_primi:
 
         bestA2 = list(pool[0]) if pool else []
         zA2 = zscore_combo(bestA2, w_blend) if bestA2 else 0.0
-        n = pick_n(zA2, bank, vol); n = max(1, min(6, n))
+        n = max(1, min(6, pick_n(zA2, bank, vol)))
         A2s = greedy_select(pool, w_blend, max(0, n-1))
 
         wr_glob = weighted_counts_rei(df_recent, last_dt)
@@ -352,7 +358,6 @@ with tab_bono:
         last_date_b = c1.date_input("Fecha último sorteo (Bonoloto)", value=pd.Timestamp.today().date())
         rein_b = c2.number_input("Reintegro (0–9)", min_value=0, max_value=9, value=2, step=1)
         comp_b = c2.number_input("Complementario (1–49)", min_value=1, max_value=49, value=18, step=1)
-
         st.markdown("**Números extraídos (6 distintos)**")
         cols = st.columns(6)
         defaults_b = [5,6,8,23,46,47]
@@ -389,10 +394,10 @@ with tab_bono:
 
         has_date_b, full_match_b = has_dup(base_b, last_dt_b, nums_b, comp_b, rein_b)
         if has_date_b and full_match_b:
-            st.success("✅ Sorteo ya existe en histórico con la misma combinación. No se añade (antiduplicado).")
+            st.success("✅ Sorteo ya existe en histórico con la misma combinación. No se añade.")
             df_recent_b = base_b.tail(WINDOW_DRAWS)
         elif has_date_b and not full_match_b:
-            st.warning("⚠️ Misma fecha con combinación distinta en el Sheet. Uso el Sheet (no añado la nueva).")
+            st.warning("⚠️ Misma fecha con combinación distinta en el Sheet. Uso el Sheet (no añado).")
             df_recent_b = base_b.tail(WINDOW_DRAWS)
         else:
             row_now_b = pd.DataFrame([{
@@ -415,7 +420,7 @@ with tab_bono:
         def terciles_ok_b(c):
             return any(1 <= x <= 16 for x in c) and any(17 <= x <= 32 for x in c) and any(33 <= x <= 49 for x in c)
 
-        def overlap_ratio_b(a,b): 
+        def overlap_ratio_b(a,b):
             return len(set(a)&set(b))/6.0
 
         cands_b, seen_b, tries_b = [], set(), 0
