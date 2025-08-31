@@ -7,16 +7,31 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ---------------- Credenciales (normaliza private_key) ----------------
+import json
+from google.oauth2.service_account import Credentials
+
 def get_gcp_credentials():
+    """
+    Lee primero el secreto 'gcp_json' (JSON completo). Si no existe, intenta el bloque [gcp_service_account].
+    Normaliza la private_key si viene con '\\n'.
+    """
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+    # Ruta A: JSON completo en secrets (recomendada)
+    if "gcp_json" in st.secrets:
+        data = json.loads(st.secrets["gcp_json"])
+        return Credentials.from_service_account_info(data, scopes=scopes)
+
+    # Ruta B: bloque por campos
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Falta [gcp_service_account] en Secrets.")
+        raise RuntimeError("Falta 'gcp_json' o [gcp_service_account] en Secrets.")
     info = dict(st.secrets["gcp_service_account"])
     pk = info.get("private_key", "")
     if isinstance(pk, str) and "\\n" in pk:
         info["private_key"] = pk.replace("\\n", "\n")
     info["private_key"] = info["private_key"].strip()
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     return Credentials.from_service_account_info(info, scopes=scopes)
+
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="centered")
