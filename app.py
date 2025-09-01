@@ -1,7 +1,8 @@
-# app.py — Primitiva & Bonoloto · Recomendador A2
-# v2: determinista, UI limpia con pestañas, métricas simples, sumador de apuestas
+# app.py — Primitiva & Bonoloto · Recomendador A2 (determinista + Joker + apuesta múltiple k)
+# v3: recomendación Joker, k=6–8 (C(k,6)), coste correcto, métricas simples, UI por pestañas
 
 import hashlib
+from math import comb
 from collections import Counter
 from pathlib import Path
 
@@ -16,7 +17,6 @@ from google.oauth2.service_account import Credentials
 # -------------------------- Config & estilos --------------------------
 st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="wide")
 
-# Carga CSS (Poppins + estilos)
 def _load_css():
     p = Path("styles.css")
     if p.exists():
@@ -141,7 +141,7 @@ HALF_LIFE_DAYS  = 60.0
 DAY_BLEND_ALPHA = 0.30
 ALPHA_DIR       = 0.30
 
-# Valores por defecto (se pueden ajustar en UI)
+# Valores por defecto (ajustables en UI)
 MU_PENALTY_DEF         = 1.00   # Aversión a patrones populares
 LAMBDA_DIVERSIDAD_DEF  = 0.60   # Penalización por solape entre A2
 
@@ -160,7 +160,7 @@ A1_FIJAS_PRIMI = {
 }
 REIN_FIJOS_PRIMI = {"Monday":1, "Thursday":8, "Saturday":0}
 
-A1_FIJAS_BONO = {i:[4,24,35,37,40,46] for i in range(7)}  # iniciales
+A1_FIJAS_BONO = {i:[4,24,35,37,40,46] for i in range(7)}  # ancla inicial por día
 
 
 # -------------------------- Utilidades de modelo --------------------------
@@ -211,15 +211,6 @@ def zscore_combo(combo, weights):
     comboMean = float(np.mean([weights.get(n,0.0) for n in combo])) if combo else 0.0
     return (comboMean - meanW)/sdW
 
-def pick_n(z, bank, vol):
-    # vol: "Bajo", "Medio", "Alto"
-    adj = 0.05 if vol=="Bajo" else -0.05 if vol=="Alto" else 0.0
-    for th in THRESH_N:
-        if z >= th["z"] + adj:
-            n = min(th["n"], int(bank))
-            return max(1, n)
-    return 1
-
 def to_js_day(dayname):
     return 1 if dayname=="Monday" else 4 if dayname=="Thursday" else 6 if dayname=="Saturday" else -1
 
@@ -237,9 +228,9 @@ def random_combo_rng(rng):
     return sorted(out)
 
 
-# -------------------------- UI Tabs --------------------------
+# -------------------------- UI --------------------------
 st.title("🎯 Primitiva & Bonoloto · Recomendador A2 (determinista)")
-st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · antiduplicados · Google Sheets")
+st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · apuesta múltiple k · Joker (Primitiva) · Google Sheets")
 
 tab_primi, tab_bono, tab_help = st.tabs(["La Primitiva", "Bonoloto", "Ayuda"])
 
@@ -247,7 +238,7 @@ tab_primi, tab_bono, tab_help = st.tabs(["La Primitiva", "Bonoloto", "Ayuda"])
 # =========================== PRIMITIVA ===========================
 with tab_primi:
     st.subheader("La Primitiva · Recomendador A2")
-    st.caption("A1 fija por día · A2 dinámica · Joker opcional (informativo)")
+    st.caption("A1 fija por día · A2 dinámica · Joker opcional · Apuesta múltiple k=6–8 (coste = C(k,6) por boleto)")
 
     df_hist = load_sheet_df("sheet_id", "worksheet_historico", "Historico")
     if df_hist.empty:
@@ -260,16 +251,23 @@ with tab_primi:
         presupuesto = c1.number_input("Presupuesto por sorteo (€)", min_value=0, value=10, step=1, key="bank_pri")
         vol = c2.selectbox("Ritmo de inversión", ["Bajo","Medio","Alto"], index=1,
                            help="Bajo: conservador · Medio: estándar · Alto: agresivo", key="vol_pri")
-        precio_apuesta = c1.number_input("Precio por apuesta (€)", min_value=0.0, value=1.0, step=0.5)
-        usar_joker = c2.checkbox("Añadir Joker al boleto", value=False,
-                                 help="Si marcas, se añade el coste del Joker al boleto (informativo).")
-        precio_joker = c2.number_input("Precio Joker (€)", min_value=0.0, value=1.0, step=0.5)
+        precio_apuesta = c1.number_input("Precio por apuesta simple (€)", min_value=0.0, value=1.0, step=0.5)
+
+        st.markdown("#### Apuesta múltiple (opcional)")
+        apuesta_multiple_on = st.checkbox("Usar apuesta múltiple (k>6)", value=False,
+                                          help="Permite jugar 7 u 8 números en una sola apuesta; el sistema genera todas las combinaciones de 6. Coste = C(k,6) × precio simple.")
+        k_tamano = st.slider("Números por apuesta (k)", 6, 8, 6, help="k=6 (simple), k=7 (×7 coste), k=8 (×28 coste).")
+
+        st.markdown("#### Joker")
+        usar_joker = st.checkbox("Añadir Joker", value=False,
+                                 help="Juego paralelo con coste fijo por boleto. Lo recomendaremos solo si hay señal y margen.")
+        precio_joker = st.number_input("Precio Joker (€)", min_value=0.0, value=1.0, step=0.5)
 
         st.markdown("---")
         mu_penalty = st.slider("Aversión a patrones populares", 0.0, 2.0, MU_PENALTY_DEF, 0.05,
-                               help="Más alto = más castigo a fechas/secuencias/sumas redondas.")
+                               help="Más alto = más castigo a fechas/secuencias/sumas típicas.")
         lambda_div = st.slider("Diversificación entre A2", 0.0, 1.5, LAMBDA_DIVERSIDAD_DEF, 0.05,
-                               help="Más alto = menos solapadas estarán las A2.")
+                               help="Más alto = menos solapadas las A2.")
         modo_det = st.checkbox("Modo determinista (recomendado)", value=True,
                                help="Misma entrada ⇒ mismas recomendaciones.")
 
@@ -341,16 +339,15 @@ with tab_primi:
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
         # Determinismo (semilla estable)
-        seed_str = f"PRIMI|{str(last_dt.date())}|{nums}|{comp}|{rein}|{DAY_BLEND_ALPHA}|{mu_penalty}|{lambda_div}"
+        seed_str = f"PRIMI|{str(last_dt.date())}|{nums}|{comp}|{rein}|{DAY_BLEND_ALPHA}|{mu_penalty}|{lambda_div}|{k_tamano}|{apuesta_multiple_on}"
         rng = get_rng(seed_str) if modo_det else np.random.default_rng()
 
         # A1 fija
         A1 = A1_FIJAS_PRIMI.get(next_dayname, [4,24,35,37,40,46])
 
-        # Candidatos A2 deterministicamente
+        # Candidatos A2 (deterministas)
         K_CANDIDATOS = 3000
         MIN_DIV = 0.60
-
         cands, seen, tries = [], set(), 0
         while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*50:
             c = tuple(random_combo_rng(rng)); tries += 1
@@ -359,18 +356,28 @@ with tab_primi:
             if not terciles_ok(c): continue
             if overlap_ratio(c, A1) > (1 - MIN_DIV): continue
             cands.append(c)
-
-        # Orden por score y pestañas de resultado
         cands = sorted(cands, key=lambda c: score_combo(c, w_blend, mu_penalty), reverse=True)
+
+        # Tabs de salida
         tab_res, tab_ap, tab_met, tab_win = st.tabs(["Recomendación", "Apuestas", "Métricas", "Ventana de referencia"])
 
         with tab_res:
             pool = cands[:1000]
             bestA2 = list(pool[0]) if pool else []
             zA2 = zscore_combo(bestA2, w_blend) if bestA2 else 0.0
-            n = pick_n(zA2, presupuesto, vol)
-            n = max(1, min(6, n))
-            # Selección greedy con diversidad
+
+            # nº boletos (A1 + A2s) vía señal y ritmo
+            def pick_n(z, presupuesto, ritmo):
+                adj = 0.05 if ritmo=="Bajo" else -0.05 if ritmo=="Alto" else 0.0
+                for th in THRESH_N:
+                    if z >= th["z"] + adj:
+                        n = min(th["n"], int(presupuesto))  # acotado por presupuesto entero
+                        return max(1, n)
+                return 1
+            n_boletos_sugeridos = pick_n(zA2, presupuesto, vol)
+            n_boletos_sugeridos = max(1, min(6, n_boletos_sugeridos))
+
+            # Selección greedy con diversidad (n-1 A2 + A1)
             def greedy_select(pool, w, n, lam):
                 if n<=0: return []
                 sp = sorted(pool, key=lambda c: score_combo(c,w,mu_penalty), reverse=True)
@@ -385,31 +392,61 @@ with tab_primi:
                     if best is None: break
                     sel.append(best)
                 return sel
-            A2s = greedy_select(pool, w_blend, max(0, n-1), lambda_div)
+            A2s = greedy_select(pool, w_blend, max(0, n_boletos_sugeridos-1), lambda_div)
 
-            # Reintegro sugerido (info; el reintegro no lo elige el usuario)
+            # Reintegro (informativo)
             wr_glob = weighted_counts_rei(df_recent, last_dt)
             wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
             rei_scores = {r: DAY_BLEND_ALPHA*wr_day.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob.get(r,0.0) for r in range(10)}
             rein_sug = max(rei_scores, key=lambda r: rei_scores[r]) if rei_scores else 0
             rein_ref = REIN_FIJOS_PRIMI.get(next_dayname, "")
 
-            # Coste total (A1 + A2s)
-            n_total = 1 + len(A2s)
-            coste = n_total*precio_apuesta + (precio_joker if usar_joker else 0.0)
+            # Apuesta múltiple: coste real
+            k_eff = k_tamano if (apuesta_multiple_on and k_tamano>6) else 6
+            simples_por_boleto = comb(k_eff, 6)  # 1, 7, 28
+            n_boletos = 1 + len(A2s)            # A1 + A2s
+            coste_apuestas = n_boletos * simples_por_boleto * precio_apuesta
+            coste = coste_apuestas + (precio_joker if usar_joker else 0.0)
 
-            st.markdown(f"### ✅ Recomendación para **{next_dayname}** ({next_dt.date().strftime('%d/%m/%Y')})")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Apuestas sugeridas (n)", n_total)
-            c2.metric("Coste estimado (€)", f"{coste:.2f}")
+            # Recomendación Joker (regla determinista)
+            def recomendar_joker(z, presupuesto, coste_actual, ritmo):
+                usar_riesgo = (ritmo in ["Medio","Alto"])
+                margen = presupuesto - coste_actual
+                return (z >= 0.35) and usar_riesgo and (margen >= precio_joker)
+
+            joker_recomendado = recomendar_joker(zA2, presupuesto, coste_apuestas, vol)
+
+            # Sugerencia automática de k (no forzamos, solo informamos)
+            k_sugerida = 6
+            if apuesta_multiple_on:
+                if zA2 >= 0.60 and presupuesto >= 40*precio_apuesta:
+                    k_sugerida = 8
+                elif zA2 >= 0.45 and presupuesto >= 12*precio_apuesta:
+                    k_sugerida = 7
+
+            # Métricas cabecera
             conf = "Alta" if zA2>=0.45 else "Media" if zA2>=0.25 else "Baja"
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Boletos (A1 + A2)", n_boletos)
+            c2.metric("Coste estimado (€)", f"{coste:.2f}")
             c3.metric("Confianza (señal)", conf)
 
             st.markdown(f"**A1 (ancla fija)**: {A1}")
             for i, c in enumerate(A2s, start=1):
                 st.write(f"**A2 #{i}**: {list(c)}")
-            st.caption(f"Reintegro (informativo): sugerido {rein_sug} · referencia del día {rein_ref}. "
-                       f"Joker: {'añadido' if usar_joker else 'no añadido'}.")
+
+            st.caption(f"Tamaño de apuesta (k): **{k_eff}** → {simples_por_boleto} combinaciones simples por boleto.")
+            if apuesta_multiple_on:
+                st.caption(f"Sugerencia automática para k (según señal/presupuesto): **{k_sugerida}**.")
+            st.caption(f"Reintegro (info): sugerido {rein_sug} · referencia del día {rein_ref}.")
+
+            # Joker: mensaje claro
+            if usar_joker:
+                st.write("**Joker**: añadido por decisión del usuario.")
+            else:
+                st.write(f"**Joker recomendado**: {'Sí' if joker_recomendado else 'No'} "
+                         f"(señal {zA2:.2f}, ritmo {vol}, "
+                         f"{'margen OK' if (presupuesto - coste_apuestas) >= precio_joker else 'sin margen'}).")
 
         with tab_ap:
             # Tabla y descarga
@@ -425,17 +462,20 @@ with tab_primi:
 
             # Escenarios rápidos
             st.markdown("#### 🎛️ Escenarios")
-            n_esc = st.slider("Forzar número de apuestas (1–6)", 1, 6, n_total)
-            coste_esc = n_esc*precio_apuesta + (precio_joker if usar_joker else 0.0)
-            st.info(f"Si juegas **{n_esc}** apuestas, el coste sería **{coste_esc:.2f} €**.")
+            n_esc = st.slider("Forzar número de boletos (1–6)", 1, 6, (1+len(A2s)))
+            k_esc = st.slider("Forzar k por boleto (6–8)", 6, 8, k_eff)
+            simples_esc = comb(k_esc, 6)
+            coste_esc = n_esc*simples_esc*precio_apuesta + (precio_joker if usar_joker else 0.0)
+            st.info(f"Si juegas **{n_esc}** boletos con **k={k_esc}** (→ {simples_esc} simples/bolet.), el coste sería **{coste_esc:.2f} €**.")
 
         with tab_met:
             st.markdown("#### 📊 Métricas (explicadas)")
-            st.write("- **Señal (z)**: intensidad relativa de la mejor A2 frente al histórico reciente.")
-            st.write("- **Diversificación**: evitamos que las A2 se pisen entre sí.")
-            st.write("- **Aversión a patrones populares**: penaliza fechas, secuencias y sumas típicas.")
-            st.write("- **Reintegro**: es informativo; no lo seleccionas tú en el boleto.")
-
+            st.info(
+                "- **Señal**: cuanto mayor, más concentración reciente de esos números.\n"
+                "- **Cobertura (k)**: con 7 u 8 números, cada boleto incluye más combinaciones (×7 o ×28 el coste).\n"
+                "- **Diversificación**: evitamos que las A2 se pisen entre sí.\n"
+                "- **Joker**: premio independiente; lo recomendamos solo si hay señal y margen."
+            )
             st.metric("Señal (z) A2 top", f"{zA2:.2f}")
             st.metric("Diversificación objetivo", f"{lambda_div:.2f}")
             st.metric("Aversión a populares", f"{mu_penalty:.2f}")
@@ -445,7 +485,6 @@ with tab_primi:
             dmin = df_recent["FECHA"].min().date() if not df_recent.empty else None
             dmax = df_recent["FECHA"].max().date() if not df_recent.empty else None
             st.write(f"Rango: **{dmin} → {dmax}**  ·  Sorteos: **{len(df_recent)}**")
-            # Top-10 números por peso
             top = sorted(w_blend.items(), key=lambda kv: kv[1], reverse=True)[:10]
             st.table(pd.DataFrame([{"Número":k, "Peso":round(v,4)} for k, v in top]))
 
@@ -453,7 +492,7 @@ with tab_primi:
 # =========================== BONOLOTO ===========================
 with tab_bono:
     st.subheader("Bonoloto · Recomendador A2")
-    st.caption("A1 ancla inicial por día · A2 dinámica · sin Joker")
+    st.caption("A1 ancla inicial por día · A2 dinámica · sin Joker · Apuesta múltiple k=6–8 (coste = C(k,6))")
 
     df_bono = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
     if df_bono.empty:
@@ -465,7 +504,12 @@ with tab_bono:
         c1, c2 = st.columns(2)
         presupuesto_b = c1.number_input("Presupuesto por sorteo (€) · Bono", min_value=0, value=10, step=1)
         vol_b = c2.selectbox("Ritmo de inversión · Bono", ["Bajo","Medio","Alto"], index=1)
-        precio_apuesta_b = c1.number_input("Precio por apuesta (€) · Bono", min_value=0.0, value=0.5, step=0.5)
+        precio_apuesta_b = c1.number_input("Precio por apuesta simple (€) · Bono", min_value=0.0, value=0.5, step=0.5)
+
+        st.markdown("#### Apuesta múltiple (opcional) · Bono")
+        apuesta_multiple_on_b = st.checkbox("Usar apuesta múltiple (k>6) · Bono", value=False)
+        k_tamano_b = st.slider("Números por apuesta (k) · Bono", 6, 8, 6)
+
         st.markdown("---")
         mu_penalty_b = st.slider("Aversión a populares · Bono", 0.0, 2.0, MU_PENALTY_DEF, 0.05)
         lambda_div_b = st.slider("Diversificación entre A2 · Bono", 0.0, 1.5, LAMBDA_DIVERSIDAD_DEF, 0.05)
@@ -531,7 +575,7 @@ with tab_bono:
         w_day_b  = weighted_counts_nums(df_recent_b[df_recent_b["weekday"]==last_dt_b.weekday()], last_dt_b)
         w_blend_b = blend(w_day_b, w_glob_b, alpha=DAY_BLEND_ALPHA)
 
-        seed_str_b = f"BONO|{str(last_dt_b.date())}|{nums_b}|{comp_b}|{rein_b}|{DAY_BLEND_ALPHA}|{mu_penalty_b}|{lambda_div_b}"
+        seed_str_b = f"BONO|{str(last_dt_b.date())}|{nums_b}|{comp_b}|{rein_b}|{DAY_BLEND_ALPHA}|{mu_penalty_b}|{lambda_div_b}|{k_tamano_b}|{apuesta_multiple_on_b}"
         rng_b = get_rng(seed_str_b) if modo_det_b else np.random.default_rng()
 
         A1b = A1_FIJAS_BONO.get((last_dt_b.weekday()+1)%7, [4,24,35,37,40,46])
@@ -554,7 +598,15 @@ with tab_bono:
             pool_b = cands_b[:1000]
             bestA2_b = list(pool_b[0]) if pool_b else []
             zA2_b = zscore_combo(bestA2_b, w_blend_b) if bestA2_b else 0.0
-            n_b = pick_n(zA2_b, presupuesto_b, vol_b)
+
+            def pick_n_b(z, presupuesto, ritmo):
+                adj = 0.05 if ritmo=="Bajo" else -0.05 if ritmo=="Alto" else 0.0
+                for th in THRESH_N:
+                    if z >= th["z"] + adj:
+                        n = min(th["n"], int(presupuesto))
+                        return max(1, n)
+                return 1
+            n_b = pick_n_b(zA2_b, presupuesto_b, vol_b)
             n_b = max(1, min(6, n_b))
 
             def greedy_select_b(pool,w,n, lam):
@@ -574,19 +626,23 @@ with tab_bono:
 
             A2s_b = greedy_select_b(pool_b, w_blend_b, max(0, n_b-1), lambda_div_b)
 
-            n_total_b = 1 + len(A2s_b)
-            coste_b = n_total_b*precio_apuesta_b
+            # Apuesta múltiple: coste real
+            k_eff_b = k_tamano_b if (apuesta_multiple_on_b and k_tamano_b>6) else 6
+            simples_por_boleto_b = comb(k_eff_b, 6)
+            n_boletos_b = 1 + len(A2s_b)
+            coste_b = n_boletos_b * simples_por_boleto_b * precio_apuesta_b
 
-            st.markdown(f"### ✅ Recomendación para **{next_dayname_b}** ({next_dt_b.date().strftime('%d/%m/%Y')})")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Apuestas sugeridas (n)", n_total_b)
-            c2.metric("Coste estimado (€)", f"{coste_b:.2f}")
             conf_b = "Alta" if zA2_b>=0.45 else "Media" if zA2_b>=0.25 else "Baja"
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Boletos (A1 + A2)", n_boletos_b)
+            c2.metric("Coste estimado (€)", f"{coste_b:.2f}")
             c3.metric("Confianza (señal)", conf_b)
 
             st.markdown(f"**A1 (ancla)**: {A1b}")
             for i, c in enumerate(A2s_b, start=1):
                 st.write(f"**A2 #{i}**: {list(c)}")
+
+            st.caption(f"Tamaño de apuesta (k): **{k_eff_b}** → {simples_por_boleto_b} simples/bolet.")
 
         with tab_ap_b:
             rows_b = [{"Tipo":"A1","N1":A1b[0],"N2":A1b[1],"N3":A1b[2],"N4":A1b[3],"N5":A1b[4],"N6":A1b[5]}]
@@ -599,11 +655,18 @@ with tab_bono:
                                data=df_out_b.to_csv(index=False).encode("utf-8"),
                                file_name="bonoloto_recomendaciones.csv", mime="text/csv")
 
-            n_esc_b = st.slider("Forzar nº de apuestas (1–6) · Bono", 1, 6, n_total_b)
-            st.info(f"Si juegas **{n_esc_b}** apuestas, el coste sería **{n_esc_b*precio_apuesta_b:.2f} €**.")
+            n_esc_b = st.slider("Forzar nº de boletos (1–6) · Bono", 1, 6, (1+len(A2s_b)))
+            k_esc_b = st.slider("Forzar k por boleto (6–8) · Bono", 6, 8, k_eff_b)
+            simples_esc_b = comb(k_esc_b, 6)
+            st.info(f"Si juegas **{n_esc_b}** boletos con **k={k_esc_b}** (→ {simples_esc_b} simples/bolet.), el coste sería **{n_esc_b*simples_esc_b*precio_apuesta_b:.2f} €**.")
 
         with tab_met_b:
             st.markdown("#### 📊 Métricas (explicadas)")
+            st.info(
+                "- **Señal**: mayor = más peso reciente.\n"
+                "- **Cobertura (k)**: 7 u 8 números multiplican combinaciones y coste.\n"
+                "- **Diversificación**: evita solapes entre A2."
+            )
             st.metric("Señal (z) A2 top", f"{zA2_b:.2f}")
             st.metric("Diversificación objetivo", f"{lambda_div_b:.2f}")
             st.metric("Aversión a populares", f"{mu_penalty_b:.2f}")
@@ -619,7 +682,7 @@ with tab_bono:
 # =========================== AYUDA ===========================
 with tab_help:
     st.subheader("Centro de ayuda")
-    st.markdown(load_md("assets/quickstart.md") or "Inicio rápido: introduce el último sorteo, calcula, descarga CSV.")
+    st.markdown(load_md("assets/quickstart.md") or "Inicio rápido: introduce el último sorteo, calcula y descarga CSV.")
     with st.expander("📘 Tutorial completo"):
         st.markdown(load_md("assets/tutorial_full.md") or "Tutorial en preparación.")
     with st.expander("❓ Preguntas frecuentes"):
