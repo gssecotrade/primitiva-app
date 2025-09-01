@@ -703,3 +703,196 @@ with tab_bono:
             })
             if okb: st.success("✅ Histórico (Bonoloto) actualizado.")
             else:   st.info("ℹ️ No se añadió al histórico (duplicado o acceso restringido).")
+              
+# =========================== AUDITORÍA ===========================
+st.markdown("---")
+with st.expander("🛡️ Auditoría de robustez (beta)", expanded=False):
+    st.caption("Pruebas automáticas de determinismo, idempotencia y backtesting rolling sobre tus Google Sheets.")
+
+    # -------- Helpers locales para auditoría --------
+    def next_primi_dt(dt):
+        wd = dt.weekday()
+        if wd==0: return dt + timedelta(days=3), "Thursday"
+        if wd==3: return dt + timedelta(days=2), "Saturday"
+        if wd==5: return dt + timedelta(days=2), "Monday"
+        return None, None
+
+    def overlaps_k(a, b):
+        return len(set(a) & set(b))
+
+    def simulate_random_boletos(num_boletos, k):
+        """Devuelve lista de boletos aleatorios de tamaño k (sin reemplazo en cada boleto)."""
+        out=[]
+        for _ in range(num_boletos):
+            pool=list(range(1,50))
+            np.random.shuffle(pool)
+            out.append(sorted(pool[:k]))
+        return out
+
+    # -------- Panel de control --------
+    colx, coly = st.columns([1,1])
+    with colx:
+        juego = st.selectbox("Juego a auditar", ["Primitiva","Bonoloto"])
+        M_eval = st.slider("Nº de sorteos para backtest (rolling)", 50, 400, 200, 10)
+        baseline_runs = st.slider("Simulaciones baseline (aleatorio)", 50, 500, 200, 50)
+    with coly:
+        usar_k_actual = st.checkbox("Usar k actual de la barra lateral", value=True)
+        k_test = k_nums if usar_k_actual else st.slider("k para auditoría", 6, 8, 6, 1)
+        usar_A2_actual = st.checkbox("Usar #A2 sugeridas (n) en rolling", value=True)
+
+    # -------- Datos de origen ----------
+    if juego=="Primitiva":
+        df_all = load_sheet_df("sheet_id","worksheet_historico","Historico")
+        fixed_A1_map = A1_FIJAS_PRIMI
+        get_next_dt = next_primi_dt
+        weekday_from_dt = lambda ndt: dayname_to_weekday(ndt[1]) if ndt[1] else -1
+    else:
+        df_all = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
+        fixed_A1_map = None  # Bonoloto usa ancla neutra por día
+        get_next_dt = lambda dt: (dt + timedelta(days=1), (dt + timedelta(days=1)).day_name())
+        weekday_from_dt = lambda ndt: (ndt[0].weekday() if ndt[0] is not None else -1)
+
+    if df_all.empty:
+        st.warning("No hay datos en el histórico para auditar.")
+        st.stop()
+
+    # -------- Rolling backtest ----------
+    # Tomamos los últimos M_eval + WINDOW_DRAWS_DEF sorteos para tener contexto
+    df_all = df_all.sort_values("FECHA").reset_index(drop=True)
+    tail_needed = min(len(df_all), M_eval + max(72, WINDOW_DRAWS_DEF*2))
+    df = df_all.tail(tail_needed).reset_index(drop=True)
+
+    resultados = []
+    # fijamos parámetros del sidebar (simulación coherente con tu UI)
+    WINDOW_DRAWS_BT    = st.session_state.get('WINDOW_DRAWS', WINDOW_DRAWS_DEF)
+    HALF_LIFE_DAYS_BT  = st.session_state.get('HALF_LIFE_DAYS', HALF_LIFE_DAYS_DEF)
+    DAY_BLEND_ALPHA_BT = st.session_state.get('DAY_BLEND_ALPHA', DAY_BLEND_ALPHA_DEF)
+    ALPHA_DIR_BT       = st.session_state.get('ALPHA_DIR', ALPHA_DIR_DEF)
+    MU_PENALTY_BT      = st.session_state.get('MU_PENALTY', MU_PENALTY_DEF)
+    LAMBDA_DIV_BT      = st.session_state.get('LAMBDA_DIVERSIDAD', LAMBDA_DIVERSIDAD_DEF)
+
+    # bucle rolling: para cada índice i, predice sorteo i usando ventana [i-WINDOW_DRAWS_BT, i-1]
+    for i in range(WINDOW_DRAWS_BT, len(df)):
+        # observado real en t=i
+        row_t = df.iloc[i]
+        real6 = sorted([int(row_t["N1"]), int(row_t["N2"]), int(row_t["N3"]), int(row_t["N4"]), int(row_t["N5"]), int(row_t["N6"])])
+
+        # ventana hasta t-1
+        base = df.iloc[max(0, i-WINDOW_DRAWS_BT):i].copy()
+        base["weekday"] = base["FECHA"].dt.weekday
+        ref_dt = pd.to_datetime(row_t["FECHA"])  # referencia temporal
+
+        # siguiente sorteo estimado
+        next_dt, next_dayname = get_next_dt(base.iloc[-1]["FECHA"])
+        if next_dt is None:
+            continue
+        weekday_mask = weekday_from_dt((next_dt, next_dayname))
+
+        # pesos
+        w_glob = weighted_counts_nums(base, ref_dt, HALF_LIFE_DAYS_BT)
+        w_day  = weighted_counts_nums(base[base["weekday"]==weekday_mask], ref_dt, HALF_LIFE_DAYS_BT)
+        w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA_BT)
+
+        # A1 (6 base)
+        if juego=="Primitiva":
+            A1_6 = fixed_A1_map.get(next_dayname, [4,24,35,37,40,46])
+        else:
+            A1_6 = A1_FIJAS_BONO.get(weekday_mask, [4,24,35,37,40,46])
+
+        # determinismo
+        seed_val = abs(hash(f"{juego}|AUDIT|{ref_dt.date()}|win={WINDOW_DRAWS_BT}|hl={HALF_LIFE_DAYS_BT}|alpha={DAY_BLEND_ALPHA_BT}|mu={MU_PENALTY_BT}|adir={ALPHA_DIR_BT}")) % (2**32 - 1)
+        np.random.seed(seed_val)
+
+        # candidatos A2
+        cands, seen, tries = [], set(), 0
+        while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*40:
+            c = tuple(random_combo()); tries += 1
+            if c in seen: continue
+            seen.add(c)
+            if not terciles_ok(c): continue
+            if overlap_ratio(c, A1_6) > (1 - MIN_DIV): continue
+            cands.append(c)
+        cands = sorted(cands, key=lambda c: score_combo(c, w_blend, ALPHA_DIR_BT, MU_PENALTY_BT), reverse=True)
+        pool = cands[:1200]
+
+        # cuántas A2?
+        best6 = list(pool[0]) if pool else []
+        zA2 = zscore_combo(best6, w_blend) if best6 else 0.0
+        n_here = pick_n(zA2, 9999, "Medium", THRESH_N) if usar_A2_actual else 3  # usar lógica de n o fijo
+
+        # seleccion greedily
+        A2s_6 = greedy_select(pool, w_blend, n_here, ALPHA_DIR_BT, MU_PENALTY_BT, LAMBDA_DIV_BT)
+        # expande si k>6 para medir “cobertura k”
+        A2s_k = [expand_to_k(a2, w_blend, k_test) for a2 in A2s_6]
+
+        # métricas por t
+        # (1) aciertos exactos 6/5/4/3 (para k=6); si k>6, medimos cobertura-máxima de 6 en cada boleto k
+        def best_hits_vs_real(boleto):
+            # si k>6, consideramos los 6 más “cercanos” en intersección con real (aprox)
+            # usaremos la intersección directa de conjuntos como “acierto” de cardinal ≤6
+            return overlaps_k(boleto, real6)
+
+        hits_top = max(best_hits_vs_real(b) for b in A2s_k) if A2s_k else 0
+        resultados.append({
+            "FECHA": row_t["FECHA"], "hits_max": hits_top, "nA2": len(A2s_k), "k": k_test
+        })
+
+    if not resultados:
+        st.warning("No se pudo ejecutar el backtest (demasiado pocos datos).")
+        st.stop()
+
+    df_res = pd.DataFrame(resultados)
+    # tasas
+    rate_3p = (df_res["hits_max"]>=3).mean()
+    rate_4p = (df_res["hits_max"]>=4).mean()
+    rate_5p = (df_res["hits_max"]>=5).mean()
+    rate_6p = (df_res["hits_max"]>=6).mean()
+    st.write("### Resultados rolling (modelo)")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("≥3 aciertos", f"{rate_3p:.2%}")
+    c2.metric("≥4 aciertos", f"{rate_4p:.2%}")
+    c3.metric("≥5 aciertos", f"{rate_5p:.3%}")
+    c4.metric("6 aciertos",  f"{rate_6p:.4%}")
+
+    # -------- Baseline aleatorio ----------
+    st.write("### Baseline aleatorio (mismo nº de boletos y k)")
+    np.random.seed(12345)
+    bl_rates = []
+    draws_eval = len(df_res)
+    for _ in range(baseline_runs):
+        cnt3=cnt4=cnt5=cnt6=0
+        for i in range(draws_eval):
+            # número de boletos iguales a nuestro nA2 (para el t correspondiente)
+            n_here = int(df_res.iloc[i]["nA2"])
+            real_row = df.iloc[WINDOW_DRAWS_BT + i]  # mismo offset temporal
+            real6 = sorted([int(real_row["N1"]),int(real_row["N2"]),int(real_row["N3"]),int(real_row["N4"]),int(real_row["N5"]),int(real_row["N6"])])
+            boletos = simulate_random_boletos(n_here, k_test)
+            hits = max(overlaps_k(b, real6) for b in boletos) if boletos else 0
+            cnt3 += 1 if hits>=3 else 0
+            cnt4 += 1 if hits>=4 else 0
+            cnt5 += 1 if hits>=5 else 0
+            cnt6 += 1 if hits>=6 else 0
+        bl_rates.append([cnt3/draws_eval, cnt4/draws_eval, cnt5/draws_eval, cnt6/draws_eval])
+    bl_rates = np.array(bl_rates)
+    mean_bl = bl_rates.mean(axis=0); lo_bl = np.percentile(bl_rates, 5, axis=0); hi_bl = np.percentile(bl_rates, 95, axis=0)
+
+    d1,d2,d3,d4 = st.columns(4)
+    d1.metric("≥3 (baseline μ)", f"{mean_bl[0]:.2%}")
+    d2.metric("≥4 (baseline μ)", f"{mean_bl[1]:.2%}")
+    d3.metric("≥5 (baseline μ)", f"{mean_bl[2]:.3%}")
+    d4.metric("6 (baseline μ)",  f"{mean_bl[3]:.4%}")
+    st.caption("Intervalos 5–95% disponibles en CSV.")
+
+    # Tabla resumen + descarga
+    out = pd.DataFrame({
+        "Metrica":[">=3",">=4",">=5","=6"],
+        "Modelo":[rate_3p,rate_4p,rate_5p,rate_6p],
+        "Baseline_mean":[mean_bl[0],mean_bl[1],mean_bl[2],mean_bl[3]],
+        "Baseline_p05":[lo_bl[0],lo_bl[1],lo_bl[2],lo_bl[3]],
+        "Baseline_p95":[hi_bl[0],hi_bl[1],hi_bl[2],hi_bl[3]],
+    })
+    st.dataframe(out, use_container_width=True)
+    st.download_button("Descargar auditoría (CSV)", data=out.to_csv(index=False).encode("utf-8"),
+                       file_name=f"auditoria_{juego.lower()}.csv", mime="text/csv")
+
+    st.caption("Interpretación rápida: si las tasas del **Modelo** superan de forma clara el intervalo 5–95% del **Baseline**, hay señal estadística. Si están dentro, el modelo es comparable a azar bajo los supuestos actuales.")
