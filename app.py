@@ -1,4 +1,4 @@
-# app.py — Primitiva & Bonoloto · Recomendador A2 (Google Sheets con gcp_json en Secrets)
+# app.py — Primitiva & Bonoloto · Recomendador A2 (Google Sheets, lectura/escritura con gcp_json)
 import json
 import streamlit as st
 import pandas as pd
@@ -7,12 +7,10 @@ from collections import Counter
 import gspread
 from google.oauth2.service_account import Credentials
 
-
 # ============================ CONFIG APP ============================
 st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="centered")
 st.title("🎯 Primitiva & Bonoloto · Recomendador A2 (n dinámico)")
-st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · antiduplicados · fuente: Google Sheets")
-
+st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · antiduplicados · Google Sheets (live)")
 
 # ============================ PARÁMETROS MODELO =====================
 WINDOW_DRAWS    = 24          # nº de sorteos recientes
@@ -50,12 +48,29 @@ A1_FIJAS_BONO = {
     6: [4, 24, 35, 37, 40, 46],  # Sunday
 }
 
+# ============================ UTILS ================================
+def notify(msg: str, ok: bool):
+    """Toast si existe, si no fallback a success/warning."""
+    try:
+        st.toast(msg, icon="✅" if ok else "⚠️")
+    except Exception:
+        (st.success if ok else st.warning)(msg)
+
+def to_js_day(dayname: str) -> int:
+    # pandas weekday(): 0=Mon..6=Sun
+    return 0 if dayname == "Monday" else 3 if dayname == "Thursday" else 5 if dayname == "Saturday" else -1
+
+def _get_secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
 # ============================ CREDENCIALES ==========================
 def get_gcp_credentials():
     """
     Lee st.secrets["gcp_json"] (pegado entre comillas simples triples en Secrets) y
-    construye las credenciales. No tocar los \n del private_key en Secrets.
+    construye las credenciales. ¡Ojo! Debe estar el JSON íntegro.
     """
     if "gcp_json" not in st.secrets:
         raise RuntimeError("Falta gcp_json en Settings → Secrets.")
@@ -63,20 +78,12 @@ def get_gcp_credentials():
         info = json.loads(st.secrets["gcp_json"])
     except Exception as e:
         raise RuntimeError(f"No puedo parsear gcp_json. Revísalo en Secrets. Detalle: {e}")
+    # Scope de ESCRITURA (para poder append_row al histórico):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     try:
         return Credentials.from_service_account_info(info, scopes=scopes)
     except Exception as e:
         raise RuntimeError(f"No puedo construir las credenciales. Revisa el JSON de la clave. Detalle: {e}")
-
-
-def _get_secret(name, default=None):
-    """Devuelve un secret plano (raíz de Secrets)."""
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
 
 # ============================ LECTURA SHEETS ========================
 @st.cache_data(ttl=600)
@@ -133,24 +140,74 @@ def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, expected_cols: 
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-
 @st.cache_data(ttl=600)
 def load_sheet_df_primi():
     expected = ["FECHA", "N1", "N2", "N3", "N4", "N5", "N6", "Complementario", "Reintegro"]
     return load_sheet_df_generic("sheet_id", "worksheet_historico", expected)
-
 
 @st.cache_data(ttl=600)
 def load_sheet_df_bono():
     expected = ["FECHA", "N1", "N2", "N3", "N4", "N5", "N6", "Complementario", "Reintegro"]
     return load_sheet_df_generic("sheet_id_bono", "worksheet_historico_bono", expected)
 
+# ============================ ESCRITURA SHEETS ======================
+def save_draw_to_sheet(sheet_id_key: str, worksheet_key: str, row_dict: dict):
+    """
+    Guarda una fila (sorteo) en el Google Sheet si la FECHA no existe aún.
+    Devuelve (ok: bool, mensaje: str).
+    """
+    try:
+        creds = get_gcp_credentials()
+        gc = gspread.authorize(creds)
+    except Exception as e:
+        return False, f"Error de credenciales al guardar: {e}"
+
+    sid = _get_secret(sheet_id_key)
+    wsn = _get_secret(worksheet_key)
+    if not sid or not wsn:
+        return False, f"Faltan Secrets `{sheet_id_key}`/`{worksheet_key}` para guardar."
+
+    try:
+        sh = gc.open_by_key(sid)
+        ws = sh.worksheet(wsn)
+    except Exception as e:
+        return False, f"No puedo abrir hoja/pestaña para guardar: {e}"
+
+    # FECHA como DD/MM/YYYY (igual que en el Sheet)
+    try:
+        fecha_str = pd.to_datetime(row_dict["FECHA"]).strftime("%d/%m/%Y")
+    except Exception:
+        return False, "FECHA inválida al guardar."
+
+    try:
+        fechas = ws.col_values(1)  # Columna A = FECHA
+    except Exception as e:
+        return False, f"No puedo leer columna FECHA: {e}"
+
+    if fecha_str in fechas:
+        return False, "La fecha ya existe en el histórico. No guardo (antiduplicado)."
+
+    # Orden esperado de columnas
+    try:
+        row = [
+            fecha_str,
+            int(row_dict["N1"]), int(row_dict["N2"]), int(row_dict["N3"]),
+            int(row_dict["N4"]), int(row_dict["N5"]), int(row_dict["N6"]),
+            int(row_dict["Complementario"]), int(row_dict["Reintegro"]),
+        ]
+    except Exception:
+        return False, "Fila de datos incompleta al guardar."
+
+    try:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True, "Guardado en Google Sheet ✅"
+    except Exception as e:
+        return False, f"No pude guardar en la hoja: {e}"
 
 # ============================ UTILIDADES MODELO =====================
 def time_weight(d, ref):
     delta = max(0, (ref - d).days)
     return float(np.exp(-np.log(2) / HALF_LIFE_DAYS * delta))
-
 
 def weighted_counts_nums(df_in, ref):
     w = {i: 0.0 for i in range(1, 50)}
@@ -161,7 +218,6 @@ def weighted_counts_nums(df_in, ref):
                 w[int(r[c])] += tw
     return w
 
-
 def weighted_counts_rei(df_in, ref):
     w = {i: 0.0 for i in range(10)}
     if "Reintegro" in df_in.columns:
@@ -170,10 +226,8 @@ def weighted_counts_rei(df_in, ref):
             w[int(r["Reintegro"])] += tw
     return w
 
-
 def blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA):
     return {n: alpha * w_day.get(n, 0.0) + (1 - alpha) * w_glob.get(n, 0.0) for n in range(1, 50)}
-
 
 def popularity_penalty(combo):
     c = sorted(combo)
@@ -188,14 +242,11 @@ def popularity_penalty(combo):
     return 1.2 * p_dates + 0.8 * consec + 0.5 * (max_dec - 2 if max_dec > 2 else 0) + \
            0.5 * (max_unit - 2 if max_unit > 2 else 0) + 0.4 * roundness
 
-
 def score_combo(combo, weights):
     return sum(np.log(weights.get(n, 0.0) + ALPHA_DIR) for n in combo) - MU_PENALTY * popularity_penalty(combo)
 
-
 def terciles_ok(combo):
     return any(1 <= x <= 16 for x in combo) and any(17 <= x <= 32 for x in combo) and any(33 <= x <= 49 for x in combo)
-
 
 def random_combo():
     pool = list(range(1, 50))
@@ -205,10 +256,8 @@ def random_combo():
         out.append(pool.pop(i))
     return sorted(out)
 
-
 def overlap_ratio(a, b):
     return len(set(a) & set(b)) / 6.0
-
 
 def zscore_combo(combo, weights):
     allW = np.array([weights.get(i, 0.0) for i in range(1, 50)], dtype=float)
@@ -217,7 +266,6 @@ def zscore_combo(combo, weights):
     comboMean = float(np.mean([weights.get(n, 0.0) for n in combo])) if combo else 0.0
     return (comboMean - meanW) / sdW
 
-
 def pick_n(z, bank, vol):
     adj = 0.05 if vol == "Low" else -0.05 if vol == "High" else 0.0
     for th in THRESH_N:
@@ -225,7 +273,6 @@ def pick_n(z, bank, vol):
             n = min(th["n"], int(bank))
             return max(1, n)
     return 1
-
 
 def greedy_select(pool, weights, n):
     if n <= 0:
@@ -245,12 +292,6 @@ def greedy_select(pool, weights, n):
             break
         selected.append(bestC)
     return selected
-
-
-def to_js_day(dayname):
-    # weekday() de pandas: 0=Mon..6=Sun
-    return 0 if dayname == "Monday" else 3 if dayname == "Thursday" else 5 if dayname == "Saturday" else -1
-
 
 # ============================ UI (Pestañas) ========================
 tab_primi, tab_bono = st.tabs(["La Primitiva", "Bonoloto"])
@@ -279,6 +320,8 @@ with tab_primi:
         cols = st.columns(6)
         defaults = [5, 6, 8, 23, 46, 47]
         nums = [cols[i].number_input(f"N{i+1}", 1, 49, defaults[i], 1, key=f"npr{i+1}") for i in range(6)]
+
+        save_new = st.checkbox("Guardar en histórico si es nuevo", value=True)
         do_calc = st.form_submit_button("Calcular recomendaciones · Primitiva")
 
     if do_calc:
@@ -303,7 +346,7 @@ with tab_primi:
 
         base = df_hist[df_hist["FECHA"] <= last_dt].sort_values("FECHA").copy()
 
-        # Antiduplicados
+        # Antiduplicados (comparación exacta si existiese esa fecha)
         def has_duplicate_row(df, last_dt, nums, comp, rein):
             if df.empty:
                 return False, False
@@ -333,7 +376,12 @@ with tab_primi:
                 "N4": nums[3], "N5": nums[4], "N6": nums[5],
                 "Complementario": comp, "Reintegro": rein
             }])
+            # Añadimos a ventana reciente para el cálculo…
             df_recent = pd.concat([base, row_now], ignore_index=True).sort_values("FECHA").tail(WINDOW_DRAWS)
+            # …y opcionalmente guardamos en el Sheet
+            if save_new:
+                ok, msg = save_draw_to_sheet("sheet_id", "worksheet_historico", row_now.iloc[0].to_dict())
+                notify(msg, ok)
 
         df_recent["weekday"] = df_recent["FECHA"].dt.weekday
 
@@ -387,7 +435,6 @@ with tab_primi:
                            data=df_out.to_csv(index=False).encode("utf-8"),
                            file_name="primitiva_recomendaciones.csv", mime="text/csv")
 
-
 # ---------------------------- BONOLOTO -----------------------------
 with tab_bono:
     st.subheader("Bonoloto · Recomendador A2")
@@ -413,6 +460,8 @@ with tab_bono:
         cols = st.columns(6)
         defaults_b = [5, 6, 8, 23, 46, 47]
         nums_b = [cols[i].number_input(f"N{i+1} (Bono)", 1, 49, defaults_b[i], 1, key=f"nbo{i+1}") for i in range(6)]
+
+        save_new_b = st.checkbox("Guardar en histórico (Bonoloto) si es nuevo", value=True)
         do_calc_b = st.form_submit_button("Calcular recomendaciones · Bonoloto")
 
     if do_calc_b:
@@ -429,7 +478,7 @@ with tab_bono:
 
         base_b = df_bono[df_bono["FECHA"] <= last_dt_b].sort_values("FECHA").copy()
 
-        # Antiduplicados
+        # Antiduplicados por fecha
         def has_dup(df, last_dt, nums, comp, rein):
             if df.empty:
                 return False, False
@@ -460,6 +509,9 @@ with tab_bono:
                 "Complementario": comp_b, "Reintegro": rein_b
             }])
             df_recent_b = pd.concat([base_b, row_now_b], ignore_index=True).sort_values("FECHA").tail(WINDOW_DRAWS)
+            if save_new_b:
+                ok, msg = save_draw_to_sheet("sheet_id_bono", "worksheet_historico_bono", row_now_b.iloc[0].to_dict())
+                notify(msg, ok)
 
         # Pesos
         df_recent_b["weekday"] = df_recent_b["FECHA"].dt.weekday
@@ -470,7 +522,7 @@ with tab_bono:
         # A1 (ancla inicial por día)
         A1b = A1_FIJAS_BONO.get((weekday + 1) % 7, [4, 24, 35, 37, 40, 46])
 
-        # Candidatos
+        # Candidatos y selección
         def score_combo_b(c, w):
             return sum(np.log(w.get(n, 0.0) + ALPHA_DIR) for n in c) - MU_PENALTY * popularity_penalty(c)
 
