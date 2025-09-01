@@ -1,62 +1,51 @@
-# app.py — Primitiva & Bonoloto · Recomendador A2 (con UX + Ayuda)
-import streamlit as st
-import pandas as pd
-import numpy as np
+# app.py — Primitiva & Bonoloto · Recomendador A2
+# v2: determinista, UI limpia con pestañas, métricas simples, sumador de apuestas
+
+import hashlib
 from collections import Counter
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ------------------------- Config & Styles -------------------------
-st.set_page_config(
-    page_title="Primitiva & Bonoloto · Recomendador A2",
-    page_icon="🎯",
-    layout="wide"
-)
 
-# Cargar estilos locales (Poppins, botones, tablas…)
+# -------------------------- Config & estilos --------------------------
+st.set_page_config(page_title="Primitiva & Bonoloto · Recomendador A2", page_icon="🎯", layout="wide")
+
+# Carga CSS (Poppins + estilos)
 def _load_css():
-    css_path = Path("styles.css")
-    if css_path.exists():
-        st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+    p = Path("styles.css")
+    if p.exists():
+        st.markdown(f"<style>{p.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
 _load_css()
 
-# ------------------------- Utilidades varias -------------------------
+
+# -------------------------- Helpers generales --------------------------
 def load_md(rel_path: str) -> str:
-    """Lee un markdown del repo (para pestaña Ayuda)."""
     p = Path(rel_path)
     if not p.exists():
-        return f"⚠️ No encuentro `{rel_path}` en el repositorio."
+        return ""
     return p.read_text(encoding="utf-8")
 
 def get_secret_key(name, group="gcp_service_account"):
-    """Obtiene un secret ya sea en la raíz o dentro de [gcp_service_account]."""
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-        if group in st.secrets and name in st.secrets[group]:
-            return st.secrets[group][name]
-    except Exception:
-        pass
+    if name in st.secrets:
+        return st.secrets[name]
+    if group in st.secrets and name in st.secrets[group]:
+        return st.secrets[group][name]
     return None
 
 def get_gcp_credentials():
-    """
-    Construye credenciales de Google desde Secrets.
-    Acepta private_key con saltos como '\n' o reales.
-    Soporta dos modos:
-      - Bloque [gcp_service_account] usual
-      - Modo gcp_json (JSON entero entre triple comilla) si existiese
-    """
-    # 1) Modo JSON entero (opcional)
+    # Permite gcp_json (opcional) o bloque [gcp_service_account]
     try:
         gcp_json = st.secrets.get("gcp_json", None)
     except Exception:
         gcp_json = None
-
     if gcp_json:
-        # Si el usuario pegó el JSON completo
         import json
         info = json.loads(gcp_json)
         pk = info.get("private_key", "")
@@ -66,7 +55,6 @@ def get_gcp_credentials():
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         return Credentials.from_service_account_info(info, scopes=scopes)
 
-    # 2) Modo bloque [gcp_service_account]
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("Falta el bloque [gcp_service_account] en Secrets.")
 
@@ -78,134 +66,64 @@ def get_gcp_credentials():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     return Credentials.from_service_account_info(info, scopes=scopes)
 
-# ------------------------- Parámetros del modelo -------------------------
-WINDOW_DRAWS    = 24
-HALF_LIFE_DAYS  = 60.0
-DAY_BLEND_ALPHA = 0.30
-ALPHA_DIR       = 0.30
-MU_PENALTY      = 1.00
-K_CANDIDATOS    = 3000
-MIN_DIV         = 0.60
-LAMBDA_DIVERSIDAD = 0.60
-
-THRESH_N = [
-  {"z": 0.50, "n": 6},
-  {"z": 0.35, "n": 4},
-  {"z": 0.20, "n": 3},
-  {"z": 0.10, "n": 2},
-  {"z":-999,  "n": 1},
-]
-
-# A1 fijas por día para PRIMITIVA (calibradas)
-A1_FIJAS_PRIMI = {
-    "Monday":    [4, 24, 35, 37, 40, 46],
-    "Thursday":  [1, 10, 23, 39, 45, 48],
-    "Saturday":  [7, 12, 14, 25, 29, 40],
-}
-REIN_FIJOS_PRIMI = {"Monday": 1, "Thursday": 8, "Saturday": 0}
-
-# A1 iniciales por día para BONOLOTO (neutras, se calibran con uso)
-A1_FIJAS_BONO = {
-    0: [4,24,35,37,40,46],  # Mon
-    1: [4,24,35,37,40,46],  # Tue
-    2: [4,24,35,37,40,46],  # Wed
-    3: [4,24,35,37,40,46],  # Thu
-    4: [4,24,35,37,40,46],  # Fri
-    5: [4,24,35,37,40,46],  # Sat
-    6: [4,24,35,37,40,46],  # Sun
-}
-
-# ------------------------- Lectura Google Sheets -------------------------
 @st.cache_data(ttl=600, show_spinner=True)
-def load_sheet_df_generic(sheet_id_key: str, worksheet_key: str, default_ws: str) -> pd.DataFrame:
-    """
-    Lee un DataFrame desde Google Sheets usando claves en Secrets.
-    Necesita:
-      sheet_id_key, p.ej. "sheet_id"
-      worksheet_key, p.ej. "worksheet_historico"
-    """
+def load_sheet_df(sheet_id_key: str, worksheet_key: str, default_ws: str) -> pd.DataFrame:
     creds = get_gcp_credentials()
     gc = gspread.authorize(creds)
-
     sid = get_secret_key(sheet_id_key)
     wsn = get_secret_key(worksheet_key) or default_ws
     if not sid:
-        st.error(
-            f"No encuentro `{sheet_id_key}` en Secrets. Añade:\n\n"
-            f"{sheet_id_key} = \"TU_SHEET_ID\"\n{worksheet_key} = \"{default_ws}\"\n"
-        )
+        st.error(f"No encuentro `{sheet_id_key}` en Secrets.")
         return pd.DataFrame()
-
     try:
         sh = gc.open_by_key(sid)
         ws = sh.worksheet(wsn)
+        rows = ws.get_all_records(numericise_ignore=["FECHA"])
     except Exception as e:
         st.error(f"No puedo abrir el Sheet/Worksheet ({sheet_id_key}/{worksheet_key}). Detalle: {e}")
         return pd.DataFrame()
 
-    rows = ws.get_all_records(numericise_ignore=["FECHA"])
     df = pd.DataFrame(rows)
-
     expected = ["FECHA","N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]
-    missing = [c for c in expected if c not in df.columns]
-    if missing:
-        st.error(f"Faltan columnas en la pestaña '{wsn}': {missing}")
-        return pd.DataFrame(columns=expected)
-
+    for c in expected:
+        if c not in df.columns:
+            df[c] = pd.NA
     df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
     df = df.dropna(subset=["FECHA"]).sort_values("FECHA").reset_index(drop=True)
-    for c in ["N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]:
+    for c in expected[1:]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    return df[expected]
 
-def load_sheet_df_primi() -> pd.DataFrame:
-    return load_sheet_df_generic("sheet_id", "worksheet_historico", "Historico")
-
-def load_sheet_df_bono() -> pd.DataFrame:
-    return load_sheet_df_generic("sheet_id_bono", "worksheet_historico_bono", "HistoricoBono")
-
-# Guardar nueva fila si no existe (antiduplicados)
 def append_if_new(sheet_id_key, worksheet_key, new_row: dict) -> bool:
-    """
-    Inserta una fila en el sheet si no existe ya una del mismo día con misma combinación.
-    Devuelve True si inserta, False si no.
-    """
+    """Antiduplicado por fecha y combinación completa."""
     try:
         creds = get_gcp_credentials()
         gc = gspread.authorize(creds)
-        sid = get_secret_key(sheet_id_key)
-        wsn = get_secret_key(worksheet_key)
-        sh = gc.open_by_key(sid)
-        ws = sh.worksheet(wsn)
-
-        # Carga actual para comprobar
+        sid = get_secret_key(sheet_id_key); wsn = get_secret_key(worksheet_key)
+        sh = gc.open_by_key(sid); ws = sh.worksheet(wsn)
         rows = ws.get_all_records(numericise_ignore=["FECHA"])
         df = pd.DataFrame(rows)
         if "FECHA" not in df.columns:
             return False
         df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
-
         same_date = df["FECHA"].dt.date == pd.to_datetime(new_row["FECHA"]).date()
         if same_date.any():
-            # Compara todos los números, complementario y reintegro
-            row = df.loc[same_date].tail(1)
+            last = df.loc[same_date].tail(1)
             try:
                 match = (
-                    int(row["N1"].values[0])==int(new_row["N1"]) and
-                    int(row["N2"].values[0])==int(new_row["N2"]) and
-                    int(row["N3"].values[0])==int(new_row["N3"]) and
-                    int(row["N4"].values[0])==int(new_row["N4"]) and
-                    int(row["N5"].values[0])==int(new_row["N5"]) and
-                    int(row["N6"].values[0])==int(new_row["N6"]) and
-                    int(row["Complementario"].values[0])==int(new_row["Complementario"]) and
-                    int(row["Reintegro"].values[0])==int(new_row["Reintegro"])
+                    int(last["N1"].values[0])==int(new_row["N1"]) and
+                    int(last["N2"].values[0])==int(new_row["N2"]) and
+                    int(last["N3"].values[0])==int(new_row["N3"]) and
+                    int(last["N4"].values[0])==int(new_row["N4"]) and
+                    int(last["N5"].values[0])==int(new_row["N5"]) and
+                    int(last["N6"].values[0])==int(new_row["N6"]) and
+                    int(last["Complementario"].values[0])==int(new_row["Complementario"]) and
+                    int(last["Reintegro"].values[0])==int(new_row["Reintegro"])
                 )
             except Exception:
                 match = False
             if match:
-                return False  # Ya está
-
-        # Si no estaba, añadir al final
+                return False
         ws.append_row([
             pd.to_datetime(new_row["FECHA"]).strftime("%d/%m/%Y"),
             int(new_row["N1"]), int(new_row["N2"]), int(new_row["N3"]),
@@ -216,7 +134,36 @@ def append_if_new(sheet_id_key, worksheet_key, new_row: dict) -> bool:
     except Exception:
         return False
 
-# ------------------------- Utilidades de modelo -------------------------
+
+# -------------------------- Parámetros del modelo --------------------------
+WINDOW_DRAWS    = 24
+HALF_LIFE_DAYS  = 60.0
+DAY_BLEND_ALPHA = 0.30
+ALPHA_DIR       = 0.30
+
+# Valores por defecto (se pueden ajustar en UI)
+MU_PENALTY_DEF         = 1.00   # Aversión a patrones populares
+LAMBDA_DIVERSIDAD_DEF  = 0.60   # Penalización por solape entre A2
+
+THRESH_N = [
+  {"z": 0.50, "n": 6},
+  {"z": 0.35, "n": 4},
+  {"z": 0.20, "n": 3},
+  {"z": 0.10, "n": 2},
+  {"z":-999,  "n": 1},
+]
+
+A1_FIJAS_PRIMI = {
+    "Monday":   [4,24,35,37,40,46],
+    "Thursday": [1,10,23,39,45,48],
+    "Saturday": [7,12,14,25,29,40],
+}
+REIN_FIJOS_PRIMI = {"Monday":1, "Thursday":8, "Saturday":0}
+
+A1_FIJAS_BONO = {i:[4,24,35,37,40,46] for i in range(7)}  # iniciales
+
+
+# -------------------------- Utilidades de modelo --------------------------
 def time_weight(d, ref):
     delta = max(0, (ref - d).days)
     return float(np.exp(-np.log(2)/HALF_LIFE_DAYS * delta))
@@ -248,19 +195,13 @@ def popularity_penalty(combo):
     decades = [x//10 for x in c]; units = [x%10 for x in c]
     max_dec = max(Counter(decades).values()); max_unit = max(Counter(units).values())
     s = sum(c); roundness = 1.0/(1.0 + abs(s-120)/10.0)
-    return 1.2*p_dates + 0.8*consec + 0.5*(max_dec-2 if max_dec>2 else 0) + 0.5*(max_unit-2 if max_unit>2 else 0) + 0.4*roundness
+    return 1.2*p_dates + 0.8*consec + 0.5*max(0, max_dec-2) + 0.5*max(0, max_unit-2) + 0.4*roundness
 
-def score_combo(combo, weights):
-    return sum(np.log(weights.get(n,0.0) + ALPHA_DIR) for n in combo) - MU_PENALTY*popularity_penalty(combo)
+def score_combo(combo, weights, mu_penalty):
+    return sum(np.log(weights.get(n,0.0) + ALPHA_DIR) for n in combo) - mu_penalty*popularity_penalty(combo)
 
 def terciles_ok(combo):
     return any(1<=x<=16 for x in combo) and any(17<=x<=32 for x in combo) and any(33<=x<=49 for x in combo)
-
-def random_combo():
-    pool = list(range(1,50)); out=[]
-    while len(out)<6:
-        i=np.random.randint(0,len(pool)); out.append(pool.pop(i))
-    return sorted(out)
 
 def overlap_ratio(a,b): return len(set(a)&set(b))/6.0
 
@@ -270,76 +211,90 @@ def zscore_combo(combo, weights):
     comboMean = float(np.mean([weights.get(n,0.0) for n in combo])) if combo else 0.0
     return (comboMean - meanW)/sdW
 
-def proxy_prob_at_least_k(k):
-    """
-    Proxy simple y homogénea para mostrar magnitudes relativas en la UI.
-    NO es probabilidad real del juego completo; sirve para comparar señales.
-    """
-    # Cuanto mayor k, menor proxy.
-    base = {1:0.25, 2:0.10, 3:0.03, 4:0.006, 5:0.0012, 6:0.0002}
-    return base.get(k, 0.0)
-
 def pick_n(z, bank, vol):
-    adj = 0.05 if vol=="Low" else -0.05 if vol=="High" else 0.0
+    # vol: "Bajo", "Medio", "Alto"
+    adj = 0.05 if vol=="Bajo" else -0.05 if vol=="Alto" else 0.0
     for th in THRESH_N:
         if z >= th["z"] + adj:
             n = min(th["n"], int(bank))
             return max(1, n)
     return 1
 
-def greedy_select(pool, weights, n):
-    if n<=0: return []
-    sorted_pool = sorted(pool, key=lambda c: score_combo(c,weights), reverse=True)
-    selected = [sorted_pool[0]]
-    while len(selected)<n:
-        bestC=None; bestVal=-1e9
-        for c in sorted_pool:
-            if any(tuple(c)==tuple(s) for s in selected): continue
-            div_pen = sum(overlap_ratio(c,s) for s in selected)
-            val = score_combo(c,weights) - LAMBDA_DIVERSIDAD*div_pen
-            if val>bestVal: bestVal=val; bestC=c
-        if bestC is None: break
-        selected.append(bestC)
-    return selected
-
 def to_js_day(dayname):
     return 1 if dayname=="Monday" else 4 if dayname=="Thursday" else 6 if dayname=="Saturday" else -1
 
-# ------------------------- UI -------------------------
-st.title("🎯 Primitiva & Bonoloto · Recomendador A2 (n dinámico)")
-st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · antiduplicados · Google Sheets (live)")
+def get_rng(seed_str: str):
+    # Semilla determinista a partir de texto estable (juego|fecha|nums|…)
+    h = hashlib.sha256(seed_str.encode("utf-8")).hexdigest()
+    seed_int = int(h[:12], 16)
+    return np.random.default_rng(seed_int)
+
+def random_combo_rng(rng):
+    pool = list(range(1,50)); out=[]
+    while len(out)<6:
+        i = rng.integers(0, len(pool))
+        out.append(pool.pop(i))
+    return sorted(out)
+
+
+# -------------------------- UI Tabs --------------------------
+st.title("🎯 Primitiva & Bonoloto · Recomendador A2 (determinista)")
+st.caption("Ventana 24 sorteos · t½=60d · mezcla por día (30%) · antipopularidad · diversidad · antiduplicados · Google Sheets")
 
 tab_primi, tab_bono, tab_help = st.tabs(["La Primitiva", "Bonoloto", "Ayuda"])
+
 
 # =========================== PRIMITIVA ===========================
 with tab_primi:
     st.subheader("La Primitiva · Recomendador A2")
-    st.caption("A1 fija por día · A2 dinámica · Joker opcional")
+    st.caption("A1 fija por día · A2 dinámica · Joker opcional (informativo)")
 
-    df_hist = load_sheet_df_primi()
+    df_hist = load_sheet_df("sheet_id", "worksheet_historico", "Historico")
     if df_hist.empty:
         st.stop()
 
-    # Sidebar - parámetros específicos
+    # Sidebar — parámetros claros
     with st.sidebar:
         st.markdown("### Primitiva · Parámetros")
-        bank = st.number_input("Banco disponible (€)", min_value=0, value=10, step=1, key="bank_primi")
-        vol  = st.selectbox("Volatilidad objetivo", ["Low","Medium","High"], index=1, key="vol_primi",
-                            help="Low: conservador · Medium: estándar · High: agresivo")
+        c1, c2 = st.columns(2)
+        presupuesto = c1.number_input("Presupuesto por sorteo (€)", min_value=0, value=10, step=1, key="bank_pri")
+        vol = c2.selectbox("Ritmo de inversión", ["Bajo","Medio","Alto"], index=1,
+                           help="Bajo: conservador · Medio: estándar · Alto: agresivo", key="vol_pri")
+        precio_apuesta = c1.number_input("Precio por apuesta (€)", min_value=0.0, value=1.0, step=0.5)
+        usar_joker = c2.checkbox("Añadir Joker al boleto", value=False,
+                                 help="Si marcas, se añade el coste del Joker al boleto (informativo).")
+        precio_joker = c2.number_input("Precio Joker (€)", min_value=0.0, value=1.0, step=0.5)
 
-    # Formulario de entrada
+        st.markdown("---")
+        mu_penalty = st.slider("Aversión a patrones populares", 0.0, 2.0, MU_PENALTY_DEF, 0.05,
+                               help="Más alto = más castigo a fechas/secuencias/sumas redondas.")
+        lambda_div = st.slider("Diversificación entre A2", 0.0, 1.5, LAMBDA_DIVERSIDAD_DEF, 0.05,
+                               help="Más alto = menos solapadas estarán las A2.")
+        modo_det = st.checkbox("Modo determinista (recomendado)", value=True,
+                               help="Misma entrada ⇒ mismas recomendaciones.")
+
+    # Formulario de entrada con botón "Cargar último del histórico"
     with st.form("entrada_primi"):
         c1, c2 = st.columns(2)
-        last_date = c1.date_input("Fecha último sorteo (Lun/Jue/Sáb)", value=pd.Timestamp.today().date())
-        rein = c2.number_input("Reintegro", min_value=0, max_value=9, value=2, step=1)
-        comp = c2.number_input("Complementario", min_value=1, max_value=49, value=18, step=1)
+        last_from_hist = c1.form_submit_button("⬇️ Cargar último del histórico")
+        if last_from_hist and not df_hist.empty:
+            last_row = df_hist.tail(1).iloc[0]
+            st.session_state["last_date_pri"] = pd.to_datetime(last_row["FECHA"]).date()
+            st.session_state["rein_pri"] = int(last_row["Reintegro"])
+            st.session_state["comp_pri"] = int(last_row["Complementario"])
+            st.session_state["nums_pri"] = [int(last_row[f"N{i}"]) for i in range(1,7)]
+
+        last_date = c1.date_input("Fecha último sorteo (Lun/Jue/Sáb)",
+                                  value=st.session_state.get("last_date_pri", pd.Timestamp.today().date()))
+        rein = c2.number_input("Reintegro (0–9)", 0, 9, st.session_state.get("rein_pri", 2), 1)
+        comp = c2.number_input("Complementario (1–49)", 1, 49, st.session_state.get("comp_pri", 18), 1)
 
         st.markdown("**Números extraídos (6 distintos)**")
         cols = st.columns(6)
-        defaults = [5,6,8,23,46,47]
-        nums = [cols[i].number_input(f"N{i+1}", 1, 49, defaults[i], 1, key=f"npr{i+1}") for i in range(6)]
+        defaults = st.session_state.get("nums_pri", [5,6,8,23,46,47])
+        nums = [cols[i].number_input(f"N{i+1}", 1, 49, defaults[i], 1, key=f"npri{i+1}") for i in range(6)]
 
-        save_hist = st.checkbox("Guardar en histórico (Primitiva) si es nuevo", value=False)
+        guardar = st.checkbox("Guardar en histórico si es nuevo", value=False)
         do_calc = st.form_submit_button("Calcular recomendaciones · Primitiva")
 
     if do_calc:
@@ -347,8 +302,14 @@ with tab_primi:
             st.error("Los 6 números deben ser distintos.")
             st.stop()
 
+        # Persisto entradas en sesión para no volver a pedirlas
+        st.session_state["last_date_pri"] = last_date
+        st.session_state["rein_pri"] = rein
+        st.session_state["comp_pri"] = comp
+        st.session_state["nums_pri"] = nums
+
         last_dt = pd.to_datetime(last_date)
-        wd = last_dt.weekday()  # 0=Mon..6=Sun
+        wd = last_dt.weekday()
         if wd==0: next_dt, next_dayname = last_dt + pd.Timedelta(days=3), "Thursday"
         elif wd==3: next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Saturday"
         elif wd==5: next_dt, next_dayname = last_dt + pd.Timedelta(days=2), "Monday"
@@ -356,116 +317,181 @@ with tab_primi:
             st.error("La fecha debe ser Lunes, Jueves o Sábado.")
             st.stop()
 
-        st.info(f"Próximo sorteo: **{next_dt.date().strftime('%d/%m/%Y')}** ({next_dayname})")
-
-        # Guardar en sheet si procede
-        if save_hist:
-            new_row = {
-                "FECHA": last_dt,
-                "N1": nums[0], "N2": nums[1], "N3": nums[2], "N4": nums[3], "N5": nums[4], "N6": nums[5],
-                "Complementario": comp, "Reintegro": rein
-            }
-            inserted = append_if_new("sheet_id", "worksheet_historico", new_row)
+        if guardar:
+            inserted = append_if_new("sheet_id","worksheet_historico",{
+                "FECHA": last_dt, "N1":nums[0],"N2":nums[1],"N3":nums[2],
+                "N4":nums[3],"N5":nums[4],"N6":nums[5],"Complementario":comp,"Reintegro":rein
+            })
             if inserted:
                 st.success("✅ Añadido al histórico (Primitiva).")
                 st.cache_data.clear()
-                df_hist = load_sheet_df_primi()
+                df_hist = load_sheet_df("sheet_id","worksheet_historico","Historico")
             else:
-                st.info("ℹ️ No se añadió: ya existe una fila igual para esa fecha o hubo un problema de acceso.")
+                st.info("ℹ️ No se añadió (duplicado o sin permisos).")
 
+        # Ventana de referencia y pesos
         base = df_hist[df_hist["FECHA"] <= last_dt].sort_values("FECHA").copy()
-        df_recent = base.tail(WINDOW_DRAWS)
+        df_recent = pd.concat([base, pd.DataFrame([{
+            "FECHA": last_dt, "N1":nums[0],"N2":nums[1],"N3":nums[2],
+            "N4":nums[3],"N5":nums[4],"N6":nums[5],"Complementario":comp,"Reintegro":rein
+        }])], ignore_index=True).sort_values("FECHA").tail(WINDOW_DRAWS)
         df_recent["weekday"] = df_recent["FECHA"].dt.weekday
-
         w_glob = weighted_counts_nums(df_recent, last_dt)
         w_day  = weighted_counts_nums(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
 
+        # Determinismo (semilla estable)
+        seed_str = f"PRIMI|{str(last_dt.date())}|{nums}|{comp}|{rein}|{DAY_BLEND_ALPHA}|{mu_penalty}|{lambda_div}"
+        rng = get_rng(seed_str) if modo_det else np.random.default_rng()
+
+        # A1 fija
         A1 = A1_FIJAS_PRIMI.get(next_dayname, [4,24,35,37,40,46])
 
-        # Candidatos A2
+        # Candidatos A2 deterministicamente
+        K_CANDIDATOS = 3000
+        MIN_DIV = 0.60
+
         cands, seen, tries = [], set(), 0
         while len(cands)<K_CANDIDATOS and tries < K_CANDIDATOS*50:
-            c = tuple(random_combo()); tries += 1
+            c = tuple(random_combo_rng(rng)); tries += 1
             if c in seen: continue
             seen.add(c)
             if not terciles_ok(c): continue
             if overlap_ratio(c, A1) > (1 - MIN_DIV): continue
             cands.append(c)
-        cands = sorted(cands, key=lambda c: score_combo(c, w_blend), reverse=True)
-        pool = cands[:1000]
 
-        bestA2 = list(pool[0]) if pool else []
-        zA2 = zscore_combo(bestA2, w_blend) if bestA2 else 0.0
-        n = pick_n(zA2, bank, vol); n = max(1, min(6, n))
-        A2s = greedy_select(pool, w_blend, max(0, n-1))
+        # Orden por score y pestañas de resultado
+        cands = sorted(cands, key=lambda c: score_combo(c, w_blend, mu_penalty), reverse=True)
+        tab_res, tab_ap, tab_met, tab_win = st.tabs(["Recomendación", "Apuestas", "Métricas", "Ventana de referencia"])
 
-        wr_glob = weighted_counts_rei(df_recent, last_dt)
-        wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
-        rei_scores = {r: DAY_BLEND_ALPHA*wr_day.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob.get(r,0.0) for r in range(10)}
-        rein_sug = max(rei_scores, key=lambda r: rei_scores[r]) if rei_scores else 0
+        with tab_res:
+            pool = cands[:1000]
+            bestA2 = list(pool[0]) if pool else []
+            zA2 = zscore_combo(bestA2, w_blend) if bestA2 else 0.0
+            n = pick_n(zA2, presupuesto, vol)
+            n = max(1, min(6, n))
+            # Selección greedy con diversidad
+            def greedy_select(pool, w, n, lam):
+                if n<=0: return []
+                sp = sorted(pool, key=lambda c: score_combo(c,w,mu_penalty), reverse=True)
+                sel=[sp[0]]
+                while len(sel)<n:
+                    best=None; bestv=-1e9
+                    for c in sp:
+                        if any(tuple(c)==tuple(s) for s in sel): continue
+                        pen=sum(overlap_ratio(c,s) for s in sel)
+                        v=score_combo(c,w,mu_penalty) - lam*pen
+                        if v>bestv: bestv=v; best=c
+                    if best is None: break
+                    sel.append(best)
+                return sel
+            A2s = greedy_select(pool, w_blend, max(0, n-1), lambda_div)
 
-        joker = (zA2 >= 0.35) and (bank >= n+1) and (vol!="Low")
+            # Reintegro sugerido (info; el reintegro no lo elige el usuario)
+            wr_glob = weighted_counts_rei(df_recent, last_dt)
+            wr_day  = weighted_counts_rei(df_recent[df_recent["weekday"]==to_js_day(next_dayname)], last_dt)
+            rei_scores = {r: DAY_BLEND_ALPHA*wr_day.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob.get(r,0.0) for r in range(10)}
+            rein_sug = max(rei_scores, key=lambda r: rei_scores[r]) if rei_scores else 0
+            rein_ref = REIN_FIJOS_PRIMI.get(next_dayname, "")
 
-        st.subheader("Resultados · Primitiva")
-        st.write(f"**A1 (fija)** {A1}  |  **n recomendado:** {n}")
-        for i, c in enumerate(A2s, start=1):
-            st.write(f"**A2 #{i}** {list(c)}")
-        st.write(f"**Reintegro sugerido (informativo)**: {rein_sug}  ·  **Ref. día**: {REIN_FIJOS_PRIMI.get(next_dayname,'')}")
-        st.write(f"**Joker recomendado**: {'Sí' if joker else 'No'}")
+            # Coste total (A1 + A2s)
+            n_total = 1 + len(A2s)
+            coste = n_total*precio_apuesta + (precio_joker if usar_joker else 0.0)
 
-        # Métricas compactas
-        with st.expander("📊 Métricas y proxy de probabilidades"):
-            st.write(f"Señal (z): **{zA2:.3f}**")
-            st.write("Proxy de p(≥k aciertos) — orientativa y homogénea:")
-            df_proxy = pd.DataFrame({
-                "k aciertos": [1,2,3,4,5,6],
-                "p_proxy": [proxy_prob_at_least_k(k) for k in [1,2,3,4,5,6]]
-            })
-            st.table(df_proxy)
+            st.markdown(f"### ✅ Recomendación para **{next_dayname}** ({next_dt.date().strftime('%d/%m/%Y')})")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Apuestas sugeridas (n)", n_total)
+            c2.metric("Coste estimado (€)", f"{coste:.2f}")
+            conf = "Alta" if zA2>=0.45 else "Media" if zA2>=0.25 else "Baja"
+            c3.metric("Confianza (señal)", conf)
 
-        # Tabla y descarga
-        rows = [{"Tipo":"A1", "N1":A1[0],"N2":A1[1],"N3":A1[2],"N4":A1[3],"N5":A1[4],"N6":A1[5]}]
-        for i, c in enumerate(A2s, start=1):
-            cl = list(c)
-            rows.append({"Tipo":f"A2-{i}", "N1":cl[0],"N2":cl[1],"N3":cl[2],"N4":cl[3],"N5":cl[4],"N6":cl[5]})
-        df_out = pd.DataFrame(rows)
-        st.dataframe(df_out, use_container_width=True)
-        st.download_button("Descargar combinaciones · Primitiva (CSV)",
-                           data=df_out.to_csv(index=False).encode("utf-8"),
-                           file_name="primitiva_recomendaciones.csv", mime="text/csv")
+            st.markdown(f"**A1 (ancla fija)**: {A1}")
+            for i, c in enumerate(A2s, start=1):
+                st.write(f"**A2 #{i}**: {list(c)}")
+            st.caption(f"Reintegro (informativo): sugerido {rein_sug} · referencia del día {rein_ref}. "
+                       f"Joker: {'añadido' if usar_joker else 'no añadido'}.")
 
-        # Últimos sorteos (vista rápida)
-        st.markdown("#### 🗂️ Últimos sorteos cargados (Primitiva)")
-        st.dataframe(df_hist.tail(10), use_container_width=True)
+        with tab_ap:
+            # Tabla y descarga
+            rows = [{"Tipo":"A1", "N1":A1[0],"N2":A1[1],"N3":A1[2],"N4":A1[3],"N5":A1[4],"N6":A1[5]}]
+            for i, c in enumerate(A2s, start=1):
+                cl = list(c)
+                rows.append({"Tipo":f"A2-{i}","N1":cl[0],"N2":cl[1],"N3":cl[2],"N4":cl[3],"N5":cl[4],"N6":cl[5]})
+            df_out = pd.DataFrame(rows)
+            st.dataframe(df_out, use_container_width=True)
+            st.download_button("Descargar combinaciones (CSV)",
+                               data=df_out.to_csv(index=False).encode("utf-8"),
+                               file_name="primitiva_recomendaciones.csv", mime="text/csv")
+
+            # Escenarios rápidos
+            st.markdown("#### 🎛️ Escenarios")
+            n_esc = st.slider("Forzar número de apuestas (1–6)", 1, 6, n_total)
+            coste_esc = n_esc*precio_apuesta + (precio_joker if usar_joker else 0.0)
+            st.info(f"Si juegas **{n_esc}** apuestas, el coste sería **{coste_esc:.2f} €**.")
+
+        with tab_met:
+            st.markdown("#### 📊 Métricas (explicadas)")
+            st.write("- **Señal (z)**: intensidad relativa de la mejor A2 frente al histórico reciente.")
+            st.write("- **Diversificación**: evitamos que las A2 se pisen entre sí.")
+            st.write("- **Aversión a patrones populares**: penaliza fechas, secuencias y sumas típicas.")
+            st.write("- **Reintegro**: es informativo; no lo seleccionas tú en el boleto.")
+
+            st.metric("Señal (z) A2 top", f"{zA2:.2f}")
+            st.metric("Diversificación objetivo", f"{lambda_div:.2f}")
+            st.metric("Aversión a populares", f"{mu_penalty:.2f}")
+
+        with tab_win:
+            st.markdown("#### 🧭 Ventana de referencia usada")
+            dmin = df_recent["FECHA"].min().date() if not df_recent.empty else None
+            dmax = df_recent["FECHA"].max().date() if not df_recent.empty else None
+            st.write(f"Rango: **{dmin} → {dmax}**  ·  Sorteos: **{len(df_recent)}**")
+            # Top-10 números por peso
+            top = sorted(w_blend.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            st.table(pd.DataFrame([{"Número":k, "Peso":round(v,4)} for k, v in top]))
+
 
 # =========================== BONOLOTO ===========================
 with tab_bono:
     st.subheader("Bonoloto · Recomendador A2")
     st.caption("A1 ancla inicial por día · A2 dinámica · sin Joker")
 
-    df_bono = load_sheet_df_bono()
+    df_bono = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
     if df_bono.empty:
         st.stop()
 
     with st.sidebar:
         st.markdown("---")
         st.markdown("### Bonoloto · Parámetros")
-        bank_b = st.number_input("Banco (€) · Bonoloto", min_value=0, value=10, step=1, key="bank_bono")
-        vol_b  = st.selectbox("Volatilidad · Bonoloto", ["Low","Medium","High"], index=1, key="vol_bono")
+        c1, c2 = st.columns(2)
+        presupuesto_b = c1.number_input("Presupuesto por sorteo (€) · Bono", min_value=0, value=10, step=1)
+        vol_b = c2.selectbox("Ritmo de inversión · Bono", ["Bajo","Medio","Alto"], index=1)
+        precio_apuesta_b = c1.number_input("Precio por apuesta (€) · Bono", min_value=0.0, value=0.5, step=0.5)
+        st.markdown("---")
+        mu_penalty_b = st.slider("Aversión a populares · Bono", 0.0, 2.0, MU_PENALTY_DEF, 0.05)
+        lambda_div_b = st.slider("Diversificación entre A2 · Bono", 0.0, 1.5, LAMBDA_DIVERSIDAD_DEF, 0.05)
+        modo_det_b = st.checkbox("Modo determinista · Bono", value=True)
 
     with st.form("entrada_bono"):
         c1, c2 = st.columns(2)
-        last_date_b = c1.date_input("Fecha último sorteo (Bonoloto)", value=pd.Timestamp.today().date())
-        rein_b = c2.number_input("Reintegro (0–9)", min_value=0, max_value=9, value=2, step=1)
-        comp_b = c2.number_input("Complementario (1–49)", min_value=1, max_value=49, value=18, step=1)
+        last_from_hist_b = c1.form_submit_button("⬇️ Cargar último del histórico (Bono)")
+        if last_from_hist_b and not df_bono.empty:
+            last_row = df_bono.tail(1).iloc[0]
+            st.session_state["last_date_b"] = pd.to_datetime(last_row["FECHA"]).date()
+            st.session_state["rein_b"] = int(last_row["Reintegro"])
+            st.session_state["comp_b"] = int(last_row["Complementario"])
+            st.session_state["nums_b"] = [int(last_row[f"N{i}"]) for i in range(1,7)]
+
+        last_date_b = c1.date_input("Fecha último sorteo (Bonoloto)",
+                                    value=st.session_state.get("last_date_b", pd.Timestamp.today().date()))
+        rein_b = c2.number_input("Reintegro (0–9)", 0, 9, st.session_state.get("rein_b", 2), 1)
+        comp_b = c2.number_input("Complementario (1–49)", 1, 49, st.session_state.get("comp_b", 18), 1)
 
         st.markdown("**Números extraídos (6 distintos)**")
         cols = st.columns(6)
-        defaults_b = [5,6,8,23,46,47]
+        defaults_b = st.session_state.get("nums_b", [10,13,17,30,41,44])
         nums_b = [cols[i].number_input(f"N{i+1} (Bono)", 1, 49, defaults_b[i], 1, key=f"nbo{i+1}") for i in range(6)]
 
-        save_hist_b = st.checkbox("Guardar en histórico (Bonoloto) si es nuevo", value=False)
+        guardar_b = st.checkbox("Guardar en histórico (Bonoloto) si es nuevo", value=False)
         do_calc_b = st.form_submit_button("Calcular recomendaciones · Bonoloto")
 
     if do_calc_b:
@@ -473,132 +499,128 @@ with tab_bono:
             st.error("Los 6 números deben ser distintos.")
             st.stop()
 
+        st.session_state["last_date_b"] = last_date_b
+        st.session_state["rein_b"] = rein_b
+        st.session_state["comp_b"] = comp_b
+        st.session_state["nums_b"] = nums_b
+
         last_dt_b = pd.to_datetime(last_date_b)
-        weekday = last_dt_b.weekday()  # 0=Mon..6=Sun
-        next_dt_b = last_dt_b + pd.Timedelta(days=1)  # Bonoloto sortea a diario
+        next_dt_b = last_dt_b + pd.Timedelta(days=1)
         next_dayname_b = next_dt_b.day_name()
 
-        st.info(f"Próximo sorteo (aprox.): **{next_dt_b.date().strftime('%d/%m/%Y')}** ({next_dayname_b})")
-
-        if save_hist_b:
-            new_row_b = {
-                "FECHA": last_dt_b,
-                "N1": nums_b[0], "N2": nums_b[1], "N3": nums_b[2],
-                "N4": nums_b[3], "N5": nums_b[4], "N6": nums_b[5],
-                "Complementario": comp_b, "Reintegro": rein_b
-            }
-            inserted_b = append_if_new("sheet_id_bono", "worksheet_historico_bono", new_row_b)
+        if guardar_b:
+            inserted_b = append_if_new("sheet_id_bono","worksheet_historico_bono",{
+                "FECHA": last_dt_b, "N1":nums_b[0],"N2":nums_b[1],"N3":nums_b[2],
+                "N4":nums_b[3],"N5":nums_b[4],"N6":nums_b[5],"Complementario":comp_b,"Reintegro":rein_b
+            })
             if inserted_b:
                 st.success("✅ Añadido al histórico (Bonoloto).")
                 st.cache_data.clear()
-                df_bono = load_sheet_df_bono()
+                df_bono = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
             else:
-                st.info("ℹ️ No se añadió: ya existe una fila igual para esa fecha o hubo un problema de acceso.")
+                st.info("ℹ️ No se añadió (duplicado o sin permisos).")
 
         base_b = df_bono[df_bono["FECHA"] <= last_dt_b].sort_values("FECHA").copy()
-        df_recent_b = base_b.tail(WINDOW_DRAWS)
+        df_recent_b = pd.concat([base_b, pd.DataFrame([{
+            "FECHA": last_dt_b, "N1":nums_b[0],"N2":nums_b[1],"N3":nums_b[2],
+            "N4":nums_b[3],"N5":nums_b[4],"N6":nums_b[5],"Complementario":comp_b,"Reintegro":rein_b
+        }])], ignore_index=True).sort_values("FECHA").tail(WINDOW_DRAWS)
         df_recent_b["weekday"] = df_recent_b["FECHA"].dt.weekday
 
         w_glob_b = weighted_counts_nums(df_recent_b, last_dt_b)
-        w_day_b  = weighted_counts_nums(df_recent_b[df_recent_b["weekday"]==weekday], last_dt_b)
+        w_day_b  = weighted_counts_nums(df_recent_b[df_recent_b["weekday"]==last_dt_b.weekday()], last_dt_b)
         w_blend_b = blend(w_day_b, w_glob_b, alpha=DAY_BLEND_ALPHA)
 
-        A1b = A1_FIJAS_BONO.get((weekday+1) % 7, [4,24,35,37,40,46])
+        seed_str_b = f"BONO|{str(last_dt_b.date())}|{nums_b}|{comp_b}|{rein_b}|{DAY_BLEND_ALPHA}|{mu_penalty_b}|{lambda_div_b}"
+        rng_b = get_rng(seed_str_b) if modo_det_b else np.random.default_rng()
 
-        # Candidatos
+        A1b = A1_FIJAS_BONO.get((last_dt_b.weekday()+1)%7, [4,24,35,37,40,46])
+
+        K_CANDIDATOS = 3000
+        MIN_DIV = 0.60
         cands_b, seen_b, tries_b = [], set(), 0
         while len(cands_b)<K_CANDIDATOS and tries_b < K_CANDIDATOS*50:
-            c = tuple(random_combo()); tries_b += 1
+            c = tuple(random_combo_rng(rng_b)); tries_b += 1
             if c in seen_b: continue
             seen_b.add(c)
             if not terciles_ok(c): continue
             if overlap_ratio(c, A1b) > (1 - MIN_DIV): continue
             cands_b.append(c)
-        cands_b = sorted(cands_b, key=lambda c: score_combo(c, w_blend_b), reverse=True)
-        pool_b = cands_b[:1000]
+        cands_b = sorted(cands_b, key=lambda c: score_combo(c, w_blend_b, mu_penalty_b), reverse=True)
 
-        bestA2_b = list(pool_b[0]) if pool_b else []
-        zA2_b = zscore_combo(bestA2_b, w_blend_b) if bestA2_b else 0.0
+        tab_res_b, tab_ap_b, tab_met_b, tab_win_b = st.tabs(["Recomendación", "Apuestas", "Métricas", "Ventana de referencia"])
 
-        def pick_n_b(z, bank, vol):
-            adj = 0.05 if vol=="Low" else -0.05 if vol=="High" else 0.0
-            for th in THRESH_N:
-                if z >= th["z"] + adj:
-                    n = min(th["n"], int(bank))
-                    return max(1, n)
-            return 1
+        with tab_res_b:
+            pool_b = cands_b[:1000]
+            bestA2_b = list(pool_b[0]) if pool_b else []
+            zA2_b = zscore_combo(bestA2_b, w_blend_b) if bestA2_b else 0.0
+            n_b = pick_n(zA2_b, presupuesto_b, vol_b)
+            n_b = max(1, min(6, n_b))
 
-        n_b = pick_n_b(zA2_b, bank_b, vol_b)
-        n_b = max(1, min(6, n_b))
+            def greedy_select_b(pool,w,n, lam):
+                if n<=0: return []
+                sp=sorted(pool,key=lambda c:score_combo(c,w,mu_penalty_b),reverse=True)
+                sel=[sp[0]]
+                while len(sel)<n:
+                    best=None; bestv=-1e9
+                    for c in sp:
+                        if any(tuple(c)==tuple(s) for s in sel): continue
+                        pen=sum(overlap_ratio(c,s) for s in sel)
+                        v=score_combo(c,w,mu_penalty_b)-lam*pen
+                        if v>bestv: bestv=v; best=c
+                    if best is None: break
+                    sel.append(best)
+                return sel
 
-        def greedy_select_b(pool,w,n):
-            if n<=0: return []
-            sp=sorted(pool,key=lambda c:score_combo(c,w),reverse=True)
-            sel=[sp[0]]
-            while len(sel)<n:
-                best=None; bestv=-1e9
-                for c in sp:
-                    if any(tuple(c)==tuple(s) for s in sel): continue
-                    pen=sum(overlap_ratio(c,s) for s in sel)
-                    v=score_combo(c,w)-LAMBDA_DIVERSIDAD*pen
-                    if v>bestv: bestv=v; best=c
-                if best is None: break
-                sel.append(best)
-            return sel
+            A2s_b = greedy_select_b(pool_b, w_blend_b, max(0, n_b-1), lambda_div_b)
 
-        A2s_b = greedy_select_b(pool_b, w_blend_b, max(0, n_b-1))
+            n_total_b = 1 + len(A2s_b)
+            coste_b = n_total_b*precio_apuesta_b
 
-        # Reintegro sugerido (informativo)
-        wr_glob_b = weighted_counts_rei(df_recent_b, last_dt_b)
-        wr_day_b  = weighted_counts_rei(df_recent_b[df_recent_b["weekday"]==weekday], last_dt_b)
-        rei_scores_b = {r: DAY_BLEND_ALPHA*wr_day_b.get(r,0.0) + (1-DAY_BLEND_ALPHA)*wr_glob_b.get(r,0.0) for r in range(10)}
-        rein_sug_b = max(rei_scores_b, key=lambda r: rei_scores_b[r]) if rei_scores_b else 0
+            st.markdown(f"### ✅ Recomendación para **{next_dayname_b}** ({next_dt_b.date().strftime('%d/%m/%Y')})")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Apuestas sugeridas (n)", n_total_b)
+            c2.metric("Coste estimado (€)", f"{coste_b:.2f}")
+            conf_b = "Alta" if zA2_b>=0.45 else "Media" if zA2_b>=0.25 else "Baja"
+            c3.metric("Confianza (señal)", conf_b)
 
-        st.subheader("Resultados · Bonoloto")
-        st.write(f"**A1 (ancla inicial)** {A1b}  |  **n recomendado:** {n_b}")
-        for i, c in enumerate(A2s_b, start=1):
-            st.write(f"**A2 #{i}** {list(c)}")
-        st.write(f"**Reintegro sugerido (informativo)**: {rein_sug_b}")
-        st.write("**Joker**: No aplica en Bonoloto")
+            st.markdown(f"**A1 (ancla)**: {A1b}")
+            for i, c in enumerate(A2s_b, start=1):
+                st.write(f"**A2 #{i}**: {list(c)}")
 
-        with st.expander("📊 Métricas y proxy de probabilidades"):
-            st.write(f"Señal (z): **{zA2_b:.3f}**")
-            df_proxy_b = pd.DataFrame({
-                "k aciertos": [1,2,3,4,5,6],
-                "p_proxy": [proxy_prob_at_least_k(k) for k in [1,2,3,4,5,6]]
-            })
-            st.table(df_proxy_b)
+        with tab_ap_b:
+            rows_b = [{"Tipo":"A1","N1":A1b[0],"N2":A1b[1],"N3":A1b[2],"N4":A1b[3],"N5":A1b[4],"N6":A1b[5]}]
+            for i, c in enumerate(A2s_b, start=1):
+                cl = list(c)
+                rows_b.append({"Tipo":f"A2-{i}","N1":cl[0],"N2":cl[1],"N3":cl[2],"N4":cl[3],"N5":cl[4],"N6":cl[5]})
+            df_out_b = pd.DataFrame(rows_b)
+            st.dataframe(df_out_b, use_container_width=True)
+            st.download_button("Descargar combinaciones (CSV) · Bonoloto",
+                               data=df_out_b.to_csv(index=False).encode("utf-8"),
+                               file_name="bonoloto_recomendaciones.csv", mime="text/csv")
 
-        rows_b = [{"Tipo":"A1","N1":A1b[0],"N2":A1b[1],"N3":A1b[2],"N4":A1b[3],"N5":A1b[4],"N6":A1b[5]}]
-        for i, c in enumerate(A2s_b, start=1):
-            cl = list(c)
-            rows_b.append({"Tipo":f"A2-{i}","N1":cl[0],"N2":cl[1],"N3":cl[2],"N4":cl[3],"N5":cl[4],"N6":cl[5]})
-        df_out_b = pd.DataFrame(rows_b)
-        st.dataframe(df_out_b, use_container_width=True)
-        st.download_button("Descargar combinaciones · Bonoloto (CSV)",
-                           data=df_out_b.to_csv(index=False).encode("utf-8"),
-                           file_name="bonoloto_recomendaciones.csv", mime="text/csv")
+            n_esc_b = st.slider("Forzar nº de apuestas (1–6) · Bono", 1, 6, n_total_b)
+            st.info(f"Si juegas **{n_esc_b}** apuestas, el coste sería **{n_esc_b*precio_apuesta_b:.2f} €**.")
 
-        st.markdown("#### 🗂️ Últimos sorteos cargados (Bonoloto)")
-        st.dataframe(df_bono.tail(10), use_container_width=True)
+        with tab_met_b:
+            st.markdown("#### 📊 Métricas (explicadas)")
+            st.metric("Señal (z) A2 top", f"{zA2_b:.2f}")
+            st.metric("Diversificación objetivo", f"{lambda_div_b:.2f}")
+            st.metric("Aversión a populares", f"{mu_penalty_b:.2f}")
+
+        with tab_win_b:
+            dmin = df_recent_b["FECHA"].min().date() if not df_recent_b.empty else None
+            dmax = df_recent_b["FECHA"].max().date() if not df_recent_b.empty else None
+            st.write(f"Rango: **{dmin} → {dmax}**  ·  Sorteos: **{len(df_recent_b)}**")
+            top_b = sorted(w_blend_b.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            st.table(pd.DataFrame([{"Número":k, "Peso":round(v,4)} for k, v in top_b]))
+
 
 # =========================== AYUDA ===========================
 with tab_help:
     st.subheader("Centro de ayuda")
-
-    # Vídeo opcional desde Secrets
-    try:
-        url = st.secrets.get("help_video_url", None)
-    except Exception:
-        url = None
-    if url:
-        st.video(url)
-
-    st.markdown("---")
-    st.markdown(load_md("assets/quickstart.md"))
-
-    with st.expander("📘 Tutorial completo", expanded=False):
-        st.markdown(load_md("assets/tutorial_full.md"))
-
-    with st.expander("❓ Preguntas frecuentes (FAQ)", expanded=False):
-        st.markdown(load_md("assets/faq.md"))
+    st.markdown(load_md("assets/quickstart.md") or "Inicio rápido: introduce el último sorteo, calcula, descarga CSV.")
+    with st.expander("📘 Tutorial completo"):
+        st.markdown(load_md("assets/tutorial_full.md") or "Tutorial en preparación.")
+    with st.expander("❓ Preguntas frecuentes"):
+        st.markdown(load_md("assets/faq.md") or "FAQ en preparación.")
