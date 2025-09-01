@@ -63,7 +63,7 @@ def get_gcp_credentials():
         info = json.loads(st.secrets["gcp_json"])
     except Exception as e:
         raise RuntimeError(f"No puedo parsear gcp_json. Revísalo en Secrets. Detalle: {e}")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     try:
         return Credentials.from_service_account_info(info, scopes=scopes)
     except Exception as e:
