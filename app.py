@@ -220,6 +220,28 @@ def lift_text_only(sc, baseline_median, pool_scores=None):
         pct_str = '—'
     return lift_str, pct_str
 
+def _parse_lift_num(txt):
+    try:
+        return float(str(txt).replace("×","").strip())
+    except:
+        return 1.0
+
+def _parse_pct_num(txt):
+    try:
+        s=str(txt).lower().replace("top","").replace("%","").replace("del azar","").strip()
+        val=float(s)
+        return max(min(val,100.0),0.0)
+    except:
+        return None
+
+def ev_proxy(p_adj, coste):
+    try:
+        coste = float(coste)
+        return float(p_adj)/coste if coste>0 else 0.0
+    except:
+        return 0.0
+
+
 # -------------------------- GOOGLE SHEETS --------------------------
 def get_gcp_credentials():
     import json as _json
@@ -301,7 +323,7 @@ def ensure_decisiones_sheet():
             ws = sh.worksheet('Decisiones')
         except Exception:
             ws = sh.add_worksheet(title='Decisiones', rows=2000, cols=16)
-            ws.append_row(["TS","Juego","FechaSorteo","Tipo","k","Numeros","Simples","Lift","Score","Pct","Joker","Coste(€)"])
+            ws.append_row(["TS","Juego","FechaSorteo","Tipo","k","Numeros","Simples","Lift","LiftNum","Score","Pct","PctNum","Joker","Coste(€)","A1","Rein_A1_ref","Rein_dyn","Window","HalfLife","AlphaDay","AlphaDir","MuPenalty","LambdaDiv","Bank","Vol","PrecioSimple","PrecioJoker","BaselineMedian","Seed","P_base","P_ajustada","EV_proxy","EV_proxy_Joker","Policy","Version"])
         return gc, sh, ws
     except Exception:
         return None, None, None
@@ -502,6 +524,56 @@ with tab_primi:
                 star = ' — ⭐ Joker' if r['Joker']=='⭐' else ''
                 st.write(f'**{r["Tipo"]}**: {list(r["Números"])}{star}  ·  ScoreJ={r["ScoreJ"]}  ·  Score={r["Score"]}  ·  Lift: {r["Lift"]}  ·  {r.get("Pct","")}')
 
+
+            # --- Recomendación Óptima (EV/€) ---
+            st.markdown("### 🏆 Recomendación Óptima (EV/€)")
+            # Selecciona A2 con mayor Lift (determinista)
+            if len(rows) > 1:
+                # rows[1:] are A2s with fields including Lift and ScoreJ
+                def _lift_num(txt):
+                    try: return float(str(txt).replace('×','').strip())
+                    except: return 1.0
+                best = max(rows[1:], key=lambda r: _lift_num(r.get('Lift','×1.00')))
+                # k recomendado: por claridad, k=6 (eficiencia por € es independiente de k). Si vol alta y multi, sugerimos k actual.
+                k_opt = 6 if vol_pr=='Low' or not (use_multi and k_nums>6) else k_nums
+                # coste por boleto (sin Joker)
+                from math import comb as C
+                simples_opt = C(k_opt,6) if k_opt>6 else 1
+                coste_opt = simples_opt * float(precio_simple)
+                # probas
+                p_base_opt = C(k_opt,6)/C(49,6)
+                lift_val = _lift_num(best.get('Lift','×1.00'))
+                p_adj_opt = p_base_opt * lift_val
+                # Joker (adaptativo)
+                scj = 0.0
+                try: scj = float(best.get('ScoreJ','0'))
+                except: pass
+                if scj >= max(0.60, float(joker_thr)): joker_msg = "⭐ Sí"
+                elif scj >= 0.45: joker_msg = "Opcional"
+                else: joker_msg = "No"
+                ev_no_j = ev_proxy(p_adj_opt, coste_opt)
+                ev_con_j = ev_proxy(p_adj_opt, coste_opt + float(precio_joker)) if joker_msg!='No' else ev_no_j
+                st.write(f"**Números**: {list(best['Números'])}")
+                st.write(f"**Lift**: {best['Lift']}  ·  **Score**: {best['Score']}  ·  **k recomendado**: {k_opt}")
+                st.write(f"**Prob. base**: 1 entre ~{int(round(1/p_base_opt)):,}  ·  **Prob. ajustada**: 1 entre ~{int(round(1/p_adj_opt)):,}")
+                st.write(f"**Joker**: {joker_msg}")
+                st.caption(f"EV/€ proxy sin Joker: {ev_no_j:.3e}  ·  con Joker: {ev_con_j:.3e} (la eficiencia por € es independiente de k; k>6 reduce varianza).")
+                if st.button("Confirmar Óptima (Primitiva)"):
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    usar_j = (joker_msg.startswith('⭐'))
+                    coste_final = coste_opt + (float(precio_joker) if usar_j else 0.0)
+                    # registrar
+                    ok = append_decision([ts,"Primitiva", next_dt.strftime("%d/%m/%Y"), best["Tipo"], int(k_opt),
+                                          ", ".join(map(str, best["Números"])), int(simples_opt), best["Lift"],
+                                          _parse_lift_num(best["Lift"]), best["Score"], best.get("Pct","—"), _parse_pct_num(best.get("Pct","")), "SI" if usar_j else "NO",
+                                          float(round(coste_final,2)),
+                                          ", ".join(map(str, A1_k if (use_multi and k_nums>6) else A1_6)), rein_sug_A1_ref, rein_sug_dynamic,
+                                          int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
+                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_median_pr) if baseline_median_pr else 0.0,
+                                          int(seed_val), float(p_base_opt), float(p_adj_opt), float(ev_no_j), float(ev_con_j), "opt", "2025-09-02-lift-det-bitacora-v3"])
+                    if ok: st.success("✅ Óptima confirmada y registrada en Google Sheets (Decisiones).")
+                    else:  st.success("✅ Óptima confirmada (no se pudo registrar en Sheets).")
+
             # --- Selección final del jugador (Primitiva) ---
             st.markdown("### ✅ Mi selección final")
             catalogo = []
@@ -537,8 +609,12 @@ with tab_primi:
                     st.session_state['selecciones'].append(entry)
                     ok = append_decision([ts,"Primitiva", next_dt.strftime("%d/%m/%Y"), chosen["Tipo"], int(chosen["k"]),
                                           ", ".join(map(str, chosen["Números"])), int(chosen["Simples"]), chosen["Lift"],
-                                          chosen["Score"], chosen.get("Pct","—"), "SI" if activar_joker else "NO",
-                                          float(round(coste_tot,2))])
+                                          _parse_lift_num(chosen["Lift"]), chosen["Score"], chosen.get("Pct","—"), _parse_pct_num(chosen.get("Pct","")), "SI" if activar_joker else "NO",
+                                          float(round(coste_tot,2)),
+                                          ", ".join(map(str, A1_k if (use_multi and k_nums>6) else A1_6)), rein_sug_A1_ref, rein_sug_dynamic,
+                                          int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
+                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_median_pr) if baseline_median_pr else 0.0,
+                                          int(seed_val), float(p_base), float(p_adj), float(ev_proxy(p_adj, coste_bolet)), float(ev_proxy(p_adj, coste_bolet + (float(precio_joker) if activar_joker else 0.0))), "manual", "2025-09-02-lift-det-bitacora-v3"])
                     if ok: st.success("✅ Apuesta confirmada y registrado en Google Sheets (Decisiones).")
                     else:  st.success("✅ Apuesta confirmada (no se pudo registrar en Sheets).")
 
@@ -726,6 +802,48 @@ with tab_bono:
                 lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
                 st.write(f'**A2 #{i}**: {list(a2)}  ·  Score={sc_val_b:.2f}  ·  Lift: {lift_txt_b}  ·  {pct_txt_b}')
 
+
+            # --- Recomendación Óptima (EV/€) ---
+            st.markdown("### 🏆 Recomendación Óptima (EV/€)")
+            if A2s_b_k:
+                def _lift_num(txt):
+                    try: return float(str(txt).replace('×','').strip())
+                    except: return 1.0
+                # construir lista con lift/score para elegir el mejor
+                cand_list = []
+                for idx, a2 in enumerate(A2s_b_k, start=1):
+                    base6_b = A2s_b_6[idx-1]
+                    sc_val_b = score_combo(base6_b, w_blend_b, ALPHA_DIR, MU_PENALTY)
+                    lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
+                    cand_list.append({"Tipo": f"A2 #{idx}", "Números": a2, "Lift": lift_txt_b, "Score": f"{sc_val_b:.2f}", "Pct": pct_txt_b})
+                best_b = max(cand_list, key=lambda r: _lift_num(r['Lift']))
+                # k recomendado
+                k_opt_b = 6 if vol_bo=='Low' or not (use_multi and k_nums>6) else k_nums
+                from math import comb as C
+                simples_opt_b = C(k_opt_b,6) if k_opt_b>6 else 1
+                coste_opt_b = simples_opt_b * float(precio_simple_bono)
+                p_base_opt_b = C(k_opt_b,6)/C(49,6)
+                lift_val_b = _lift_num(best_b['Lift'])
+                p_adj_opt_b = p_base_opt_b * lift_val_b
+                ev_no_j_b = ev_proxy(p_adj_opt_b, coste_opt_b)
+                st.write(f"**Números**: {list(best_b['Números'])}")
+                st.write(f"**Lift**: {best_b['Lift']}  ·  **Score**: {best_b['Score']}  ·  **k recomendado**: {k_opt_b}")
+                st.write(f"**Prob. base**: 1 entre ~{int(round(1/p_base_opt_b)):,}  ·  **Prob. ajustada**: 1 entre ~{int(round(1/p_adj_opt_b)):,}")
+                st.caption(f"EV/€ proxy: {ev_no_j_b:.3e} (independiente de k; k>6 reduce varianza).")
+                if st.button("Confirmar Óptima (Bonoloto)"):
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    coste_final_b = coste_opt_b
+                    ok2 = append_decision([ts,"Bonoloto", next_dt_b.strftime("%d/%m/%Y"), best_b["Tipo"], int(k_opt_b),
+                                          ", ".join(map(str, best_b["Números"])), int(simples_opt_b), best_b["Lift"],
+                                          _parse_lift_num(best_b["Lift"]), best_b["Score"], best_b.get("Pct","—"), _parse_pct_num(best_b.get("Pct","")), "NO",
+                                          float(round(coste_final_b,2)),
+                                          ", ".join(map(str, A1b_k if (use_multi and k_nums>6) else A1b_6)), "-", "-",
+                                          int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
+                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_median_bo) if baseline_median_bo else 0.0,
+                                          int(seed_val_b), float(p_base_opt_b), float(p_adj_opt_b), float(ev_no_j_b), float(ev_no_j_b), "opt", "2025-09-02-lift-det-bitacora-v3"])
+                    if ok2: st.success("✅ Óptima confirmada y registrada en Google Sheets (Decisiones).")
+                    else:   st.success("✅ Óptima confirmada (no se pudo registrar en Sheets).")
+
             # --- Selección final del jugador (Bonoloto) ---
             st.markdown("### ✅ Mi selección final")
             catalogo_b = []
@@ -768,7 +886,11 @@ with tab_bono:
                     st.session_state['selecciones'].append(entry)
                     ok2 = append_decision([ts,"Bonoloto", next_dt_b.strftime("%d/%m/%Y"), chosen_b["Tipo"], int(chosen_b["k"]),
                                           ", ".join(map(str, chosen_b["Números"])), int(chosen_b["Simples"]), chosen_b["Lift"],
-                                          chosen_b["Score"], chosen_b.get("Pct","—"), "NO", float(round(coste_bolet_b,2))])
+                                          _parse_lift_num(chosen_b["Lift"]), chosen_b["Score"], chosen_b.get("Pct","—"), _parse_pct_num(chosen_b.get("Pct","")), "NO", float(round(coste_bolet_b,2)),
+                                          ", ".join(map(str, A1b_k if (use_multi and k_nums>6) else A1b_6)), "-", "-",
+                                          int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
+                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_median_bo) if baseline_median_bo else 0.0,
+                                          int(seed_val_b), float(p_base), float(p_adj), float(ev_proxy(p_adj, coste_bolet_b)), float(ev_proxy(p_adj, coste_bolet_b)), "manual", "2025-09-02-lift-det-bitacora-v3"])
                     if ok2: st.success("✅ Apuesta confirmada y registrada en Google Sheets (Decisiones).")
                     else:   st.success("✅ Apuesta confirmada (no se pudo registrar en Sheets).")
 
