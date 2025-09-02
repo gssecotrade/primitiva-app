@@ -311,7 +311,7 @@ with st.sidebar:
                                          help="Bonoloto: las apuestas son múltiplos de 0,50 € por apuesta.")
 
 # -------------------------- TABS JUEGOS --------------------------
-tab_primi, tab_bono, tab_sim = st.tabs(["La Primitiva", "Bonoloto", "🧪 Simulador"])
+tab_primi, tab_bono, tab_sim, tab_help = st.tabs(["La Primitiva", "Bonoloto", "🧪 Simulador", "📘 Tutorial"])
 # =========================== PRIMITIVA ===========================
 with tab_primi:
     st.subheader(f"La Primitiva · Recomendador A2 · k={'múltiple' if (use_multi and k_nums>6) else '6'}")
