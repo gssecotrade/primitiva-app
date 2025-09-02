@@ -1,6 +1,7 @@
-# app.py — Francisco Cabrera · Predictor de La Primitiva & Bonoloto
+# app.py — Francisco Cabrera · Predictor de La Primitiva & Bonoloto (+ Simulador integrado)
 # UI moderno + k-múltiple + determinismo + Google Sheets (read/write) + métricas + Joker por apuesta
 # Mejoras: autorrelleno desde histórico y simulación coherente en ambos juegos
+# 2025-09-02: Añadida pestaña "Simulador" y ajuste de precio Bonoloto (múltiplos de 0,50 € por apuesta).
 
 import math
 import numpy as np
@@ -131,7 +132,7 @@ def random_combo():
     return sorted(out)
 
 def overlap_ratio(a,b): 
-    return len(set(a)&set(b))/6.0
+    return len(set(a) & set(b))/6.0
 
 def zscore_combo(combo, weights):
     allW = np.array([weights.get(i,0.0) for i in range(1,50)], dtype=float)
@@ -305,10 +306,12 @@ with st.sidebar:
     st.subheader("Parámetros · Bonoloto")
     bank_bo = st.number_input("Banco (€) · Bonoloto", min_value=0, value=10, step=1, key="bank_bono")
     vol_bo  = st.selectbox("Volatilidad · Bonoloto", ["Low","Medium","High"], index=1, key="vol_bono")
+    # Precio Bonoloto en múltiplos de 0,50 €
+    precio_simple_bono = st.number_input("Precio por apuesta simple (Bonoloto) €", min_value=0.0, value=0.50, step=0.5, format="%.2f",
+                                         help="Bonoloto: las apuestas son múltiplos de 0,50 € por apuesta.")
 
 # -------------------------- TABS JUEGOS --------------------------
-tab_primi, tab_bono = st.tabs(["La Primitiva", "Bonoloto"])
-
+tab_primi, tab_bono, tab_sim = st.tabs(["La Primitiva", "Bonoloto", "🧪 Simulador"])
 # =========================== PRIMITIVA ===========================
 with tab_primi:
     st.subheader(f"La Primitiva · Recomendador A2 · k={'múltiple' if (use_multi and k_nums>6) else '6'}")
@@ -366,7 +369,7 @@ with tab_primi:
                 else:
                     last_dt = pd.to_datetime(last_date)
 
-    if do_calc:
+    if 'do_calc' in locals() and do_calc:
         if len(set(nums))!=6:
             st.error("Los 6 números deben ser distintos.")
             st.stop()
@@ -546,7 +549,7 @@ with tab_primi:
 with tab_bono:
     st.subheader(f"Bonoloto · Recomendador A2 · k={'múltiple' if (use_multi and k_nums>6) else '6'}")
 
-    # Carga histórico una vez para autorrelleno
+    # Carga histórico una vez para autorrellenar
     df_b_full = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
     last_rec_b = df_b_full.tail(1) if not df_b_full.empty else pd.DataFrame()
 
@@ -593,7 +596,7 @@ with tab_bono:
                     save_hist_b = False
                     st.info("La fecha ya estaba en el histórico (Bonoloto). Se han usado los datos existentes.")
 
-    if do_calc_b:
+    if 'do_calc_b' in locals() and do_calc_b:
         if len(set(nums_b))!=6:
             st.error("Los 6 números deben ser distintos.")
             st.stop()
@@ -651,15 +654,17 @@ with tab_bono:
         A2s_b_k = [expand_to_k(a2, w_blend_b, k_nums) if (use_multi and k_nums>6) else a2 for a2 in A2s_b_6]
 
         combos_por_boleto_b = comb(k_nums,6) if (use_multi and k_nums>6) else 1
-        coste_b = float(st.session_state.get("precio_simple", 1.0) if "precio_simple" in st.session_state else 1.0)
-        coste_b = coste_b * (1 + len(A2s_b_k)) * combos_por_boleto_b  # A1 + A2s
+        # Bonoloto: coste en múltiplos de 0,50 € por apuesta simple
+        coste_total_b = (1 + len(A2s_b_k)) * combos_por_boleto_b * float(precio_simple_bono)
+        # Redondeo a céntimos por claridad visual (ya es múltiplo de 0,50 si precio_simple_bono lo es)
+        coste_total_b = round(coste_total_b + 1e-9, 2)
 
         subB1, subB2, subB3, subB4 = st.tabs(["Recomendación", "Apuestas", "Métricas", "Ventana de referencia"])
 
         with subB1:
             cA, cB, cC = st.columns([1,1,1])
             cA.metric("Boletos (A1 + A2)", 1 + len(A2s_b_k))
-            cB.metric("Coste estimado (€)", f"{coste_b:,.2f}")
+            cB.metric("Coste estimado (€)", f"{coste_total_b:,.2f}")
             cC.metric("Confianza (señal)", conf_label(zA2_b))
 
             st.write(f"**A1**: {A1b_k if (use_multi and k_nums>6) else A1b_6}")
@@ -816,7 +821,7 @@ with st.expander("🛡️ Auditoría de robustez (beta)", expanded=False):
         pool = cands[:1200]
 
         # cuántas A2?
-        best6 = list(pool[0]) if pool else []
+        best6 = list(pool[0]) if pool else 0*[0]
         zA2 = zscore_combo(best6, w_blend) if best6 else 0.0
         n_here = pick_n(zA2, 9999, "Medium", THRESH_N) if usar_A2_actual else 3  # usar lógica de n o fijo
 
@@ -826,11 +831,8 @@ with st.expander("🛡️ Auditoría de robustez (beta)", expanded=False):
         A2s_k = [expand_to_k(a2, w_blend, k_test) for a2 in A2s_6]
 
         # métricas por t
-        # (1) aciertos exactos 6/5/4/3 (para k=6); si k>6, medimos cobertura-máxima de 6 en cada boleto k
         def best_hits_vs_real(boleto):
-            # si k>6, consideramos los 6 más “cercanos” en intersección con real (aprox)
-            # usaremos la intersección directa de conjuntos como “acierto” de cardinal ≤6
-            return overlaps_k(boleto, real6)
+            return len(set(boleto) & set(real6))
 
         hits_top = max(best_hits_vs_real(b) for b in A2s_k) if A2s_k else 0
         resultados.append({
@@ -866,8 +868,12 @@ with st.expander("🛡️ Auditoría de robustez (beta)", expanded=False):
             n_here = int(df_res.iloc[i]["nA2"])
             real_row = df.iloc[WINDOW_DRAWS_BT + i]  # mismo offset temporal
             real6 = sorted([int(real_row["N1"]),int(real_row["N2"]),int(real_row["N3"]),int(real_row["N4"]),int(real_row["N5"]),int(real_row["N6"])])
-            boletos = simulate_random_boletos(n_here, k_test)
-            hits = max(overlaps_k(b, real6) for b in boletos) if boletos else 0
+            out=[]
+            for _b in range(n_here):
+                pool=list(range(1,50))
+                np.random.shuffle(pool)
+                out.append(sorted(pool[:k_test]))
+            hits = max(len(set(b) & set(real6)) for b in out) if out else 0
             cnt3 += 1 if hits>=3 else 0
             cnt4 += 1 if hits>=4 else 0
             cnt5 += 1 if hits>=5 else 0
@@ -896,3 +902,165 @@ with st.expander("🛡️ Auditoría de robustez (beta)", expanded=False):
                        file_name=f"auditoria_{juego.lower()}.csv", mime="text/csv")
 
     st.caption("Interpretación rápida: si las tasas del **Modelo** superan de forma clara el intervalo 5–95% del **Baseline**, hay señal estadística. Si están dentro, el modelo es comparable a azar bajo los supuestos actuales.")
+# =========================== 🧪 SIMULADOR (INTEGRADO) ===========================
+with tab_sim:
+    st.subheader("Simulador de escenarios")
+    st.caption("Genera candidatos con restricciones, rankea por score y exporta CSV. "
+               "Se incluyen **5 escenarios preconfigurados** autogenerados desde tu Google Sheet.")
+
+    # --------- Carga histórico (ambos) ---------
+    df_pr = load_sheet_df("sheet_id","worksheet_historico","Historico")
+    df_bo = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
+
+    juego_sim = st.selectbox("Juego a simular", ["La Primitiva","Bonoloto"], index=0)
+
+    if juego_sim=="La Primitiva":
+        df_in = df_pr.copy()
+    else:
+        df_in = df_bo.copy()
+
+    if df_in.empty:
+        st.warning("No hay datos en el histórico para este juego.")
+        st.stop()
+
+    df_in = df_in.sort_values("FECHA").reset_index(drop=True)
+    last_dt = pd.to_datetime(df_in["FECHA"].max())
+    base = df_in.tail(st.session_state.get('WINDOW_DRAWS', WINDOW_DRAWS_DEF)).copy()
+    base["weekday"] = base["FECHA"].dt.weekday
+
+    # parámetros (sidebar)
+    WINDOW_DRAWS    = st.session_state.get('WINDOW_DRAWS', WINDOW_DRAWS_DEF)
+    HALF_LIFE_DAYS  = st.session_state.get('HALF_LIFE_DAYS', HALF_LIFE_DAYS_DEF)
+    DAY_BLEND_ALPHA = st.session_state.get('DAY_BLEND_ALPHA', DAY_BLEND_ALPHA_DEF)
+    ALPHA_DIR       = st.session_state.get('ALPHA_DIR', ALPHA_DIR_DEF)
+    MU_PENALTY      = st.session_state.get('MU_PENALTY', MU_PENALTY_DEF)
+    LAMBDA_DIVERSIDAD = st.session_state.get('LAMBDA_DIVERSIDAD', LAMBDA_DIVERSIDAD_DEF)
+
+    # próximo sorteo estimado + A1 ancla
+    if juego_sim=="La Primitiva":
+        wd_today = last_dt.weekday()
+        if wd_today==0: next_dt, next_dn = last_dt + timedelta(days=3), "Thursday"
+        elif wd_today==3: next_dt, next_dn = last_dt + timedelta(days=2), "Saturday"
+        elif wd_today==5: next_dt, next_dn = last_dt + timedelta(days=2), "Monday"
+        else:
+            next_dt, next_dn = last_dt + timedelta(days=2), "Monday"
+        weekday_mask = dayname_to_weekday(next_dn)
+        A1_anchor = A1_FIJAS_PRIMI.get(next_dn, [4,24,35,37,40,46])
+    else:
+        next_dt, next_dn = last_dt + timedelta(days=1), (last_dt + timedelta(days=1)).day_name()
+        weekday_mask = next_dt.weekday()
+        A1_anchor = A1_FIJAS_BONO.get(weekday_mask, [4,24,35,37,40,46])
+
+    w_glob = weighted_counts_nums(base, last_dt, HALF_LIFE_DAYS)
+    w_day  = weighted_counts_nums(base[base["weekday"]==weekday_mask], last_dt, HALF_LIFE_DAYS)
+    w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
+
+    st.write(f"**Próximo sorteo estimado:** {next_dt.date().strftime('%d/%m/%Y')} ({next_dn})")
+    st.write(f"**A1 de referencia (ancla de diversidad):** {A1_anchor}")
+
+    # --------- Generadores internos ---------
+    def gen_candidates(n, sum_rng, odd_rng, cons_max, decades_max=None, banned=None, required=None, anchor=None):
+        res=[]; seen=set(); tries=0
+        banned=set(banned or []); required=set(required or [])
+        while len(res)<n and tries<n*60:
+            c = tuple(sorted(random_combo())); tries+=1
+            if c in seen: continue
+            seen.add(c)
+            s = sum(c)
+            if not (sum_rng[0]<=s<=sum_rng[1]): continue
+            o = sum(1 for x in c if x%2==1)
+            if not (odd_rng[0]<=o<=odd_rng[1]): continue
+            cons = sum(1 for a,b in zip(c,c[1:]) if b==a+1)
+            if cons>cons_max: continue
+            if banned and any(x in banned for x in c): continue
+            if required and not all(x in c for x in required): continue
+            if decades_max is not None:
+                dec = {i:0 for i in range(5)}
+                for x in c:
+                    idx = min((x-1)//10, 4); dec[idx]+=1
+                if any(dec[i]>decades_max for i in dec): continue
+            if anchor is not None:
+                if overlap_ratio(c, A1_anchor) > (1 - MIN_DIV):  # diversidad vs A1
+                    continue
+            res.append(list(c))
+        return res
+
+    def rank_candidates(cands):
+        scored = [(c, score_combo(c, w_blend, ALPHA_DIR, MU_PENALTY)) for c in cands]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        rows=[]
+        for i,(c,sc) in enumerate(scored[:200], start=1):
+            rows.append({"rank":i, "combo":c, "score":round(sc,4), "suma":sum(c),
+                         "impares":sum(1 for x in c if x%2==1),
+                         "consecutivos":sum(1 for a,b in zip(sorted(c), sorted(c)[1:]) if b==a+1)})
+        return pd.DataFrame(rows)
+
+    # --------- 5 escenarios preconfigurados (auto, generados ya) ---------
+    # Frecuencias de la ventana
+    nums_cols = ["N1","N2","N3","N4","N5","N6"]
+    freqs = {n:0 for n in range(1,50)}
+    for _, r in base.iterrows():
+        for c in nums_cols:
+            if not pd.isna(r[c]):
+                freqs[int(r[c])] += 1
+    top_hot = sorted(freqs.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    top_hot = [n for n,_ in top_hot]
+    top_cold = sorted(freqs.items(), key=lambda kv: kv[1])[:10]
+    top_cold = [n for n,_ in top_cold]
+
+    escenarios_auto = [
+        {"nombre":"Equilibrio clásico",       "sum_rng":(110,190),"odd_rng":(2,4),"cons_max":2,"decades_max":3,"banned":[],"required":[]},
+        {"nombre":"Hot mix (señal reciente)", "sum_rng":(115,200),"odd_rng":(2,5),"cons_max":2,"decades_max":3,"banned":[],"required":top_hot[:2]},
+        {"nombre":"Delay lovers (fríos)",     "sum_rng":(100,185),"odd_rng":(2,4),"cons_max":1,"decades_max":2,"banned":top_hot[:3],"required":top_cold[:2]},
+        {"nombre":"Bajo riesgo",              "sum_rng":(120,180),"odd_rng":(2,4),"cons_max":1,"decades_max":2,"banned":[],"required":[]},
+        {"nombre":"Explorador amplio",        "sum_rng":(100,210),"odd_rng":(1,5),"cons_max":3,"decades_max":None,"banned":[],"required":[]},
+    ]
+
+    st.markdown("### Escenarios preconfigurados (autogenerados)")
+    escenarios_generados = {}
+    for esc in escenarios_auto:
+        cands = gen_candidates(
+            n=5000, sum_rng=esc["sum_rng"], odd_rng=esc["odd_rng"], cons_max=esc["cons_max"],
+            decades_max=esc["decades_max"], banned=esc["banned"], required=esc["required"], anchor=A1_anchor
+        )
+        if cands:
+            df_rank = rank_candidates(cands)
+            escenarios_generados[esc["nombre"]] = df_rank
+
+    if not escenarios_generados:
+        st.warning("No se pudieron generar escenarios con la ventana actual. Ajusta parámetros o amplía ventana.")
+    else:
+        # Selector y descarga inmediata
+        nombre_sel = st.selectbox("Ver escenario", list(escenarios_generados.keys()), index=0)
+        df_view = escenarios_generados[nombre_sel]
+        st.dataframe(df_view, use_container_width=True, height=360)
+        st.download_button(f"Descargar CSV — {nombre_sel}",
+                           data=df_view.to_csv(index=False).encode("utf-8"),
+                           file_name=f"escenario_{nombre_sel.replace(' ','_')}.csv", mime="text/csv")
+
+    st.markdown("### Escenario personalizado")
+    with st.form("form_custom"):
+        name = st.text_input("Nombre del escenario", value="Escenario personalizado")
+        n_cands = st.slider("Candidatos a muestrear", 500, 20000, 6000, 100)
+        sum_min, sum_max = st.slider("Rango de suma", 60, 260, (110, 195), 1)
+        odd_min, odd_max = st.slider("Rango de impares", 0, 6, (2, 4), 1)
+        cons_max = st.slider("Consecutivos máx.", 0, 5, 2, 1)
+        decades_max = st.slider("Máx por década (0=sin tope)", 0, 6, 0, 1)
+        decades_max = None if decades_max==0 else decades_max
+        banned = st.multiselect("Excluir números", list(range(1,50)))
+        required = st.multiselect("Forzar números", list(range(1,50)), default=[])
+        run = st.form_submit_button("Generar candidatos")
+
+    if run:
+        cands = gen_candidates(
+            n=n_cands, sum_rng=(sum_min,sum_max), odd_rng=(odd_min,odd_max), cons_max=cons_max,
+            decades_max=decades_max, banned=banned, required=required, anchor=A1_anchor
+        )
+        if not cands:
+            st.warning("No se generaron candidatos con esas restricciones.")
+        else:
+            df_rank = rank_candidates(cands)
+            st.dataframe(df_rank, use_container_width=True, height=360)
+            st.download_button(f"Descargar CSV — {name}",
+                               data=df_rank.to_csv(index=False).encode("utf-8"),
+                               file_name=f"escenario_{name.replace(' ','_')}.csv", mime="text/csv")
