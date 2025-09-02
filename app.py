@@ -1064,3 +1064,51 @@ with tab_sim:
             st.download_button(f"Descargar CSV — {name}",
                                data=df_rank.to_csv(index=False).encode("utf-8"),
                                file_name=f"escenario_{name.replace(' ','_')}.csv", mime="text/csv")
+# =========================== 📘 TUTORIAL (AYUDA) ===========================
+with tab_help:
+    st.subheader("Cómo usar el recomendador (explicado sin tecnicismos)")
+    st.caption("Guía sencilla para entender qué hace la app y cómo sacarle partido, "
+               "sin necesidad de matemáticas o estadística.")
+
+    st.markdown("""
+### 1) ¿Qué son A1 y A2?
+- **A1**: Es como el **boleto base** del día. En Primitiva depende de si es lunes, jueves o sábado.  
+- **A2**: Son las **apuestas recomendadas** para complementar el A1, evitando repetir patrones comunes.
+
+### 2) ¿Qué significa k?
+- Con **k=6**: boleto normal, 1 combinación.  
+- Con **k=7 u 8**: boleto múltiple → dentro hay muchas combinaciones. Ej.: k=8 = 28 combinaciones.  
+
+### 3) ¿Qué hace la app?
+- Mira el **histórico de sorteos** y da más peso a lo reciente.  
+- Calcula una **señal por número** (quién está “fuerte”).  
+- Penaliza combinaciones demasiado típicas (consecutivos, todos bajos, etc.).  
+- Elige varias A2 que se parezcan poco entre sí y al A1 (diversidad).  
+
+### 4) ¿Cómo leer la pantalla principal?
+- **A1**: tu boleto ancla del sorteo.  
+- **A2 #1, A2 #2...**: sugerencias que la app genera.  
+- **Confianza (señal)**: indica si los números recomendados están bien alineados con el histórico.  
+- **Coste total**: cuánto pagarías en base a simples y múltiple.
+
+### 5) ¿Qué pasa con el Joker y Bonoloto?
+- En **Primitiva**: el sistema te dice en qué A2 merece la pena poner Joker (⭐).  
+- En **Bonoloto**: cada apuesta cuesta múltiplos de **0,50 €**, y el cálculo se ajusta solo.
+
+### 6) ¿Cómo usar el Simulador?
+- Es un laboratorio para probar restricciones: rango de suma, nº de impares, consecutivos, excluir/forzar números, etc.  
+- Tienes **5 escenarios preconfigurados**:
+  - Equilibrio clásico → boletos “normales”.  
+  - Hot mix → con números calientes.  
+  - Delay lovers → con números fríos.  
+  - Bajo riesgo → pocos consecutivos, control por décadas.  
+  - Explorador amplio → abre el abanico.  
+
+### 7) Consejos prácticos
+- No apuestes siempre a tus favoritos: alterna escenarios.  
+- Con **k>6** ten en cuenta que sube rápido el coste.  
+- Recuerda: la lotería es aleatoria. Esto no garantiza premios, pero te ayuda a organizar y diversificar mejor.
+
+---
+👉 Si algo no te cuadra, revisa la pestaña **🧪 Simulador** o carga más sorteos en el histórico.
+    """)
