@@ -707,22 +707,22 @@ with tab_bono:
             do_calc_b = st.form_submit_button('Calcular recomendaciones · Bonoloto')
 
         if do_calc_b:
-            if df_b_full.empty:
-              last_dt_b = pd.to_datetime(last_date_b)
-        else:
-            target_b = pd.to_datetime(last_date_b).date()
-            same_b = df_b_full["FECHA"].dt.date == target_b
-            if same_b.any():
-              rb = df_b_full.loc[same_b].tail(1).iloc[0]
-              last_dt_b = pd.to_datetime(rb["FECHA"])
-              nums_b = [int(rb["N1"]), int(rb["N2"]), int(rb["N3"]), int(rb["N4"]), int(rb["N5"]), int(rb["N6"])]
-              comp_b = int(rb["Complementario"]) if not pd.isna(rb["Complementario"]) else 18
-              rein_b = int(rb["Reintegro"]) if not pd.isna(rb["Reintegro"]) else 0
-              save_hist_b = False
-              st.info("La fecha ya estaba en el histórico (Bonoloto). Se han usado los datos existentes.")
-          else:
-              # ✅ Caso que faltaba: fecha manual NO existe en histórico
-              last_dt_b = pd.to_datetime(last_date_b)
+           if df_b_full.empty:
+    last_dt_b = pd.to_datetime(last_date_b)
+else:
+    target_b = pd.to_datetime(last_date_b).date()
+    same_b = df_b_full["FECHA"].dt.date == target_b
+    if same_b.any():
+        rb = df_b_full.loc[same_b].tail(1).iloc[0]
+        last_dt_b = pd.to_datetime(rb["FECHA"])
+        nums_b = [int(rb["N1"]), int(rb["N2"]), int(rb["N3"]), int(rb["N4"]), int(rb["N5"]), int(rb["N6"])]
+        comp_b = int(rb["Complementario"]) if not pd.isna(rb["Complementario"]) else 18
+        rein_b = int(rb["Reintegro"]) if not pd.isna(rb["Reintegro"]) else 0
+        save_hist_b = False
+        st.info("La fecha ya estaba en el histórico (Bonoloto). Se han usado los datos existentes.")
+    else:
+        # ✅ Caso que faltaba: fecha manual NO existe en histórico
+        last_dt_b = pd.to_datetime(last_date_b)
 
     if 'do_calc_b' in locals() and do_calc_b:
         if len(set(nums_b))!=6:
