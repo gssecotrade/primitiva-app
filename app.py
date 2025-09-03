@@ -1,6 +1,6 @@
 # app.py — Francisco Cabrera · Predictor de La Primitiva & Bonoloto
-# Recomendador determinista + Lift, Joker, Simulador, Tutorial
-# NUEVO: Selección final del jugador + Bitácora (registro en Google Sheets) + Mini-informe
+# Recomendador determinista + Lift recalibrado (p05 baseline), Joker, Simulador, Tutorial
+# Selección final del jugador + Recomendación Óptima (EV/€) + Bitácora + Estadísticas (opt vs manual)
 
 import math
 import numpy as np
@@ -191,7 +191,7 @@ def joker_score(combo, weights, rein_dict):
         reinN = 0.0
     return 0.6*zN + 0.4*reinN
 
-def random_baseline_scores(weights, alpha_dir, mu_penalty, rng, n=800):
+def random_baseline_scores(weights, alpha_dir, mu_penalty, rng, n=1600):
     out = []
     tries = 0
     while len(out) < n and tries < n*20:
@@ -202,14 +202,16 @@ def random_baseline_scores(weights, alpha_dir, mu_penalty, rng, n=800):
     if not out:
         return None, None
     arr = np.array(out, dtype=float)
-    return arr, float(np.median(np.exp(arr)))
+    exp_arr = np.exp(arr)
+    # Tougher baseline = 5th percentile of exp(scores) for spread
+    return arr, float(np.percentile(exp_arr, 5))
 
-def lift_text_only(sc, baseline_median, pool_scores=None):
-    if not baseline_median or baseline_median <= 0:
-        return '—', '—'
+def lift_text_only(sc, baseline_ref, pool_scores=None):
+    if not baseline_ref or baseline_ref <= 0:
+        return '×1.00', '—'
     val = math.exp(sc)
-    ratio = val / baseline_median
-    ratio = max(min(ratio, 3.0), 0.33)
+    ratio = val / baseline_ref
+    ratio = max(ratio, 0.33)  # allow >×3 when signal is strong
     lift_str = f'×{ratio:.2f}'
     if pool_scores is not None and len(pool_scores) > 0:
         exp_pool = np.exp(np.array(pool_scores, dtype=float))
@@ -240,7 +242,6 @@ def ev_proxy(p_adj, coste):
         return float(p_adj)/coste if coste>0 else 0.0
     except:
         return 0.0
-
 
 # -------------------------- GOOGLE SHEETS --------------------------
 def get_gcp_credentials():
@@ -322,8 +323,10 @@ def ensure_decisiones_sheet():
         try:
             ws = sh.worksheet('Decisiones')
         except Exception:
-            ws = sh.add_worksheet(title='Decisiones', rows=2000, cols=16)
-            ws.append_row(["TS","Juego","FechaSorteo","Tipo","k","Numeros","Simples","Lift","LiftNum","Score","Pct","PctNum","Joker","Coste(€)","A1","Rein_A1_ref","Rein_dyn","Window","HalfLife","AlphaDay","AlphaDir","MuPenalty","LambdaDiv","Bank","Vol","PrecioSimple","PrecioJoker","BaselineMedian","Seed","P_base","P_ajustada","EV_proxy","EV_proxy_Joker","Policy","Version"])
+            ws = sh.add_worksheet(title='Decisiones', rows=4000, cols=40)
+            ws.append_row(["TS","Juego","FechaSorteo","Tipo","k","Numeros","Simples","Lift","LiftNum","Score","Pct","PctNum","Joker","Coste(€)",
+                           "A1","Rein_A1_ref","Rein_dyn","Window","HalfLife","AlphaDay","AlphaDir","MuPenalty","LambdaDiv","Bank","Vol",
+                           "PrecioSimple","PrecioJoker","BaselineMedian","Seed","P_base","P_ajustada","EV_proxy","EV_proxy_Joker","Policy","Version"])
         return gc, sh, ws
     except Exception:
         return None, None, None
@@ -370,12 +373,12 @@ with st.sidebar:
                                          help='Bonoloto: múltiplos de 0,50€')
 
 # -------------------------- TABS --------------------------
-tab_primi, tab_bono, tab_sim, tab_help, tab_log = st.tabs(['La Primitiva', 'Bonoloto', '🧪 Simulador', '📘 Tutorial', '📒 Bitácora'])
+tab_primi, tab_bono, tab_sim, tab_help, tab_log, tab_stats = st.tabs(['La Primitiva', 'Bonoloto', '🧪 Simulador', '📘 Tutorial', '📒 Bitácora', '📊 Estadísticas'])
 
 # =========================== PRIMITIVA ===========================
 with tab_primi:
     st.subheader(f'La Primitiva · Recomendador A2 · k={"múltiple" if (use_multi and k_nums>6) else "6"}')
-    st.caption('1) Elige la fuente del último sorteo · 2) Pulsa **Calcular** · 3) Elige tu A2 final y confirma.')
+    st.caption('Flujo: **Calcular** → **🏆 Óptima** → **Confirmar**. (Abajo tienes una apuesta única recomendada; puedes ampliar cobertura si quieres.)')
 
     df_hist_full = load_sheet_df('sheet_id','worksheet_historico','Historico')
     last_rec = df_hist_full.tail(1) if not df_hist_full.empty else pd.DataFrame()
@@ -446,14 +449,14 @@ with tab_primi:
         base['weekday'] = base['FECHA'].dt.weekday
 
         weekday_mask = dayname_to_weekday(next_dayname)
-        w_glob = weighted_counts_nums(base, last_dt, HALF_LIFE_DAYS_DEF if 'HALF_LIFE_DAYS' not in st.session_state else st.session_state.get('HALF_LIFE_DAYS', HALF_LIFE_DAYS_DEF))
-        w_day  = weighted_counts_nums(base[base['weekday']==weekday_mask], last_dt, HALF_LIFE_DAYS_DEF if 'HALF_LIFE_DAYS' not in st.session_state else st.session_state.get('HALF_LIFE_DAYS', HALF_LIFE_DAYS_DEF))
         HALF_LIFE_DAYS = st.session_state.get('HALF_LIFE_DAYS', HALF_LIFE_DAYS_DEF)
         DAY_BLEND_ALPHA = st.session_state.get('DAY_BLEND_ALPHA', DAY_BLEND_ALPHA_DEF)
         ALPHA_DIR = st.session_state.get('ALPHA_DIR', ALPHA_DIR_DEF)
         MU_PENALTY = st.session_state.get('MU_PENALTY', MU_PENALTY_DEF)
         LAMBDA_DIVERSIDAD = st.session_state.get('LAMBDA_DIVERSIDAD', LAMBDA_DIVERSIDAD_DEF)
 
+        w_glob = weighted_counts_nums(base, last_dt, HALF_LIFE_DAYS)
+        w_day  = weighted_counts_nums(base[base['weekday']==weekday_mask], last_dt, HALF_LIFE_DAYS)
         w_blend = blend(w_day, w_glob, alpha=DAY_BLEND_ALPHA)
         rein_dict = compute_rein_probs(base, last_dt, weekday_mask, HALF_LIFE_DAYS, DAY_BLEND_ALPHA)
         rein_sug_dynamic = max(rein_dict, key=lambda r: rein_dict[r]) if rein_dict else 0
@@ -484,7 +487,7 @@ with tab_primi:
         A2s_k = [expand_to_k(a2, w_blend, k_nums) if (use_multi and k_nums>6) else a2 for a2 in A2s_6]
 
         rng_base = np.random.default_rng(stable_seed('BASELINE','PRIMITIVA', last_dt.date()))
-        pool_scores_pr, baseline_median_pr = random_baseline_scores(w_blend, ALPHA_DIR, MU_PENALTY, rng_base, n=800)
+        pool_scores_pr, baseline_ref_pr = random_baseline_scores(w_blend, ALPHA_DIR, MU_PENALTY, rng_base, n=1600)
 
         rows = []
         total_simples = 0
@@ -500,7 +503,7 @@ with tab_primi:
             sc_joker = joker_score(base6, w_blend, rein_dict) if use_joker else 0.0
             flag = (use_joker and sc_joker >= joker_thr)
             sc_val = score_combo(base6, w_blend, ALPHA_DIR, MU_PENALTY)
-            lift_txt, pct_txt = lift_text_only(sc_val, baseline_median_pr, pool_scores_pr)
+            lift_txt, pct_txt = lift_text_only(sc_val, baseline_ref_pr, pool_scores_pr)
             simples_this = comb(k_nums,6) if (use_multi and k_nums>6) else 1
             rows.append({'Tipo': f'A2 #{i}' + (f' (k={k_nums})' if (use_multi and k_nums>6) else ''),
                          'Números': a2,'k': k_nums if (use_multi and k_nums>6) else 6,'Simples': simples_this,
@@ -514,7 +517,7 @@ with tab_primi:
         subtab1, subtab2, subtab3, subtab4 = st.tabs(['Recomendación', 'Apuestas', 'Métricas', 'Ventana'])
 
         with subtab1:
-            st.caption('**Cómo leer**: Lift ×1.40 = 1.4× mejor que azar. ⭐ indica Joker recomendado.')
+            st.caption('**Cómo leer**: Lift ×N = N veces mejor que azar. ⭐ indica Joker recomendado.')
             cA, cB, cC = st.columns([1,1,1])
             cA.metric('Boletos (A1 + A2)', 1 + len(A2s_k))
             cB.metric('Coste estimado (€)', f'{coste_total:,.2f}')
@@ -522,29 +525,22 @@ with tab_primi:
             st.write(f'**A1**: {rows[0]["Números"]}')
             for r in rows[1:]:
                 star = ' — ⭐ Joker' if r['Joker']=='⭐' else ''
-                st.write(f'**{r["Tipo"]}**: {list(r["Números"])}{star}  ·  ScoreJ={r["ScoreJ"]}  ·  Score={r["Score"]}  ·  Lift: {r["Lift"]}  ·  {r.get("Pct","")}')
-
+                st.write(f'**{r["Tipo"]}**: {list(r["Números"])}{star}  ·  Lift: {r["Lift"]}')
 
             # --- Recomendación Óptima (EV/€) ---
             st.markdown("### 🏆 Recomendación Óptima (EV/€)")
-            # Selecciona A2 con mayor Lift (determinista)
             if len(rows) > 1:
-                # rows[1:] are A2s with fields including Lift and ScoreJ
                 def _lift_num(txt):
                     try: return float(str(txt).replace('×','').strip())
                     except: return 1.0
                 best = max(rows[1:], key=lambda r: _lift_num(r.get('Lift','×1.00')))
-                # k recomendado: por claridad, k=6 (eficiencia por € es independiente de k). Si vol alta y multi, sugerimos k actual.
                 k_opt = 6 if vol_pr=='Low' or not (use_multi and k_nums>6) else k_nums
-                # coste por boleto (sin Joker)
                 from math import comb as C
                 simples_opt = C(k_opt,6) if k_opt>6 else 1
                 coste_opt = simples_opt * float(precio_simple)
-                # probas
                 p_base_opt = C(k_opt,6)/C(49,6)
                 lift_val = _lift_num(best.get('Lift','×1.00'))
                 p_adj_opt = p_base_opt * lift_val
-                # Joker (adaptativo)
                 scj = 0.0
                 try: scj = float(best.get('ScoreJ','0'))
                 except: pass
@@ -554,7 +550,7 @@ with tab_primi:
                 ev_no_j = ev_proxy(p_adj_opt, coste_opt)
                 ev_con_j = ev_proxy(p_adj_opt, coste_opt + float(precio_joker)) if joker_msg!='No' else ev_no_j
                 st.write(f"**Números**: {list(best['Números'])}")
-                st.write(f"**Lift**: {best['Lift']}  ·  **Score**: {best['Score']}  ·  **k recomendado**: {k_opt}")
+                st.write(f"**Lift**: {best['Lift']}  ·  **k recomendado**: {k_opt}")
                 st.write(f"**Prob. base**: 1 entre ~{int(round(1/p_base_opt)):,}  ·  **Prob. ajustada**: 1 entre ~{int(round(1/p_adj_opt)):,}")
                 st.write(f"**Joker**: {joker_msg}")
                 st.caption(f"EV/€ proxy sin Joker: {ev_no_j:.3e}  ·  con Joker: {ev_con_j:.3e} (la eficiencia por € es independiente de k; k>6 reduce varianza).")
@@ -562,15 +558,14 @@ with tab_primi:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     usar_j = (joker_msg.startswith('⭐'))
                     coste_final = coste_opt + (float(precio_joker) if usar_j else 0.0)
-                    # registrar
                     ok = append_decision([ts,"Primitiva", next_dt.strftime("%d/%m/%Y"), best["Tipo"], int(k_opt),
                                           ", ".join(map(str, best["Números"])), int(simples_opt), best["Lift"],
                                           _parse_lift_num(best["Lift"]), best["Score"], best.get("Pct","—"), _parse_pct_num(best.get("Pct","")), "SI" if usar_j else "NO",
                                           float(round(coste_final,2)),
                                           ", ".join(map(str, A1_k if (use_multi and k_nums>6) else A1_6)), rein_sug_A1_ref, rein_sug_dynamic,
                                           int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
-                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_median_pr) if baseline_median_pr else 0.0,
-                                          int(seed_val), float(p_base_opt), float(p_adj_opt), float(ev_no_j), float(ev_con_j), "opt", "2025-09-02-lift-det-bitacora-v3"])
+                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_ref_pr) if baseline_ref_pr else 0.0,
+                                          int(seed_val), float(p_base_opt), float(p_adj_opt), float(ev_no_j), float(ev_con_j), "opt", "2025-09-03-wizard-v1"])
                     if ok: st.success("✅ Óptima confirmada y registrada en Google Sheets (Decisiones).")
                     else:  st.success("✅ Óptima confirmada (no se pudo registrar en Sheets).")
 
@@ -578,7 +573,7 @@ with tab_primi:
             st.markdown("### ✅ Mi selección final")
             catalogo = []
             for r in rows[1:]:
-                label = f"{r['Tipo']} · k={r['k']} · Lift {r['Lift']} · {r.get('Pct','')}"
+                label = f"{r['Tipo']} · k={r['k']} · Lift {r['Lift']}"
                 catalogo.append((label, r))
             if catalogo:
                 labels = [c[0] for c in catalogo]
@@ -593,12 +588,19 @@ with tab_primi:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     coste_bolet = chosen["Simples"] * float(precio_simple)
                     coste_tot = coste_bolet + (float(precio_joker) if activar_joker else 0.0)
+
+                    from math import comb as C
+                    k_val = int(chosen["k"])
+                    p_base = C(k_val, 6) / C(49, 6)
+                    lift_num = _parse_lift_num(chosen["Lift"])
+                    p_adj = p_base * lift_num
+
                     entry = {
                         "ts": ts, "juego": "Primitiva",
                         "fecha_sorteo": next_dt.date().strftime("%d/%m/%Y"),
                         "tipo": chosen["Tipo"],
                         "numeros": list(chosen["Números"]),
-                        "k": int(chosen["k"]),
+                        "k": k_val,
                         "simples": int(chosen["Simples"]),
                         "lift_txt": chosen["Lift"],
                         "score": chosen["Score"],
@@ -607,25 +609,17 @@ with tab_primi:
                         "coste": float(round(coste_tot,2))
                     }
                     st.session_state['selecciones'].append(entry)
-                    ok = append_decision([ts,"Primitiva", next_dt.strftime("%d/%m/%Y"), chosen["Tipo"], int(chosen["k"]),
+                    ok = append_decision([ts,"Primitiva", next_dt.strftime("%d/%m/%Y"), chosen["Tipo"], k_val,
                                           ", ".join(map(str, chosen["Números"])), int(chosen["Simples"]), chosen["Lift"],
                                           _parse_lift_num(chosen["Lift"]), chosen["Score"], chosen.get("Pct","—"), _parse_pct_num(chosen.get("Pct","")), "SI" if activar_joker else "NO",
                                           float(round(coste_tot,2)),
                                           ", ".join(map(str, A1_k if (use_multi and k_nums>6) else A1_6)), rein_sug_A1_ref, rein_sug_dynamic,
                                           int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
-                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_median_pr) if baseline_median_pr else 0.0,
-                                          int(seed_val), float(p_base), float(p_adj), float(ev_proxy(p_adj, coste_bolet)), float(ev_proxy(p_adj, coste_bolet + (float(precio_joker) if activar_joker else 0.0))), "manual", "2025-09-02-lift-det-bitacora-v3"])
+                                          int(bank_pr), vol_pr, float(precio_simple), float(precio_joker), float(baseline_ref_pr) if baseline_ref_pr else 0.0,
+                                          int(seed_val), float(p_base), float(p_adj), float(ev_proxy(p_adj, coste_bolet)), float(ev_proxy(p_adj, coste_bolet + (float(precio_joker) if activar_joker else 0.0))), "manual", "2025-09-03-wizard-v1"])
                     if ok: st.success("✅ Apuesta confirmada y registrado en Google Sheets (Decisiones).")
                     else:  st.success("✅ Apuesta confirmada (no se pudo registrar en Sheets).")
 
-                    from math import comb as C
-                    def parse_lift_multiplier(lift_txt):
-                        try: return float(str(lift_txt).replace('×','').strip())
-                        except: return 1.0
-                    k_val = entry["k"]
-                    p_base = C(k_val, 6) / C(49, 6)
-                    lift_num = parse_lift_multiplier(entry["lift_txt"])
-                    p_adj = p_base * lift_num
                     st.markdown("### 🧾 Mini-informe")
                     colA, colB, colC = st.columns(3)
                     colA.metric("Juego", "Primitiva")
@@ -633,7 +627,7 @@ with tab_primi:
                     colC.metric("Coste (€)", f"{entry['coste']:.2f}")
                     st.write(f"**Números**: {entry['numeros']}")
                     st.write(f"**Fecha sorteo**: {entry['fecha_sorteo']}  ·  **Tipo**: {entry['tipo']}")
-                    st.write(f"**Lift**: {entry['lift_txt']}  ·  **Score**: {entry['score']}  ·  **Percentil**: {entry['pct']}")
+                    st.write(f"**Lift**: {entry['lift_txt']}  ·  **Score**: {entry['score']}")
                     st.write(f"**Prob. base** (k={k_val}): 1 entre ~{int(round(1/p_base)):,}")
                     st.write(f"**Prob. ajustada (Lift)**: 1 entre ~{int(round(1/p_adj)):,}")
                     if entry["joker"]:
@@ -645,13 +639,12 @@ with tab_primi:
                     txt.append(f"Tipo: {entry['tipo']}")
                     txt.append(f"k: {entry['k']}  |  Simples: {entry['simples']}")
                     txt.append(f"Números: {', '.join(map(str,entry['numeros']))}")
-                    txt.append(f"Lift: {entry['lift_txt']}  |  Score: {entry['score']}  |  Pct: {entry['pct']}")
+                    txt.append(f"Lift: {entry['lift_txt']}  |  Score: {entry['score']}")
                     txt.append(f"Prob. base (k={k_val}): 1 / ~{int(round(1/p_base))}")
                     txt.append(f"Prob. ajustada (Lift): 1 / ~{int(round(1/p_adj))}")
                     txt.append(f"Joker: {'SI' if entry['joker'] else 'NO'}")
                     txt.append(f"Coste (€): {entry['coste']:.2f}")
-                    txt_data = "\n".join(txt).encode("utf-8")
-                    st.download_button("💾 Descargar mini-informe (TXT)", data=txt_data,
+                    st.download_button("💾 Descargar mini-informe (TXT)", data=("\n".join(txt)).encode("utf-8"),
                                        file_name=f"mi_apuesta_primitiva_{ts.replace(':','-')}.txt", mime="text/plain")
 
         with subtab2:
@@ -680,7 +673,7 @@ with tab_primi:
 # =========================== BONOLOTO ===========================
 with tab_bono:
     st.subheader(f'Bonoloto · Recomendador A2 · k={"múltiple" if (use_multi and k_nums>6) else "6"}')
-    st.caption('1) Elige la fuente del último sorteo · 2) Pulsa **Calcular** · 3) Elige tu A2 final y confirma.')
+    st.caption('Flujo: **Calcular** → **🏆 Óptima** → **Confirmar**. (Abajo tienes una apuesta única recomendada; puedes ampliar cobertura si quieres.)')
 
     df_b_full = load_sheet_df('sheet_id_bono','worksheet_historico_bono','HistoricoBono')
     last_rec_b = df_b_full.tail(1) if not df_b_full.empty else pd.DataFrame()
@@ -781,7 +774,7 @@ with tab_bono:
         A2s_b_k = [expand_to_k(a2, w_blend_b, k_nums) if (use_multi and k_nums>6) else a2 for a2 in A2s_b_6]
 
         rng_base_b = np.random.default_rng(stable_seed('BASELINE','BONOLOTO', last_dt_b.date()))
-        pool_scores_bo, baseline_median_bo = random_baseline_scores(w_blend_b, ALPHA_DIR, MU_PENALTY, rng_base_b, n=800)
+        pool_scores_bo, baseline_ref_bo = random_baseline_scores(w_blend_b, ALPHA_DIR, MU_PENALTY, rng_base_b, n=1600)
 
         combos_por_boleto_b = comb(k_nums,6) if (use_multi and k_nums>6) else 1
         coste_total_b = (1 + len(A2s_b_k)) * combos_por_boleto_b * float(precio_simple_bono)
@@ -790,7 +783,7 @@ with tab_bono:
         subB1, subB2, subB3, subB4 = st.tabs(['Recomendación', 'Apuestas', 'Métricas', 'Ventana'])
 
         with subB1:
-            st.caption('**Cómo leer**: Lift ×1.30 = 1.3× mejor que azar.')
+            st.caption('**Cómo leer**: Lift ×N = N veces mejor que azar.')
             cA, cB, cC = st.columns([1,1,1])
             cA.metric('Boletos (A1 + A2)', 1 + len(A2s_b_k))
             cB.metric('Coste estimado (€)', f'{coste_total_b:,.2f}')
@@ -799,9 +792,8 @@ with tab_bono:
             for i, a2 in enumerate(A2s_b_k, start=1):
                 base6_b = A2s_b_6[i-1]
                 sc_val_b = score_combo(base6_b, w_blend_b, ALPHA_DIR, MU_PENALTY)
-                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
-                st.write(f'**A2 #{i}**: {list(a2)}  ·  Score={sc_val_b:.2f}  ·  Lift: {lift_txt_b}  ·  {pct_txt_b}')
-
+                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_ref_bo, pool_scores_bo)
+                st.write(f'**A2 #{i}**: {list(a2)}  ·  Lift: {lift_txt_b}')
 
             # --- Recomendación Óptima (EV/€) ---
             st.markdown("### 🏆 Recomendación Óptima (EV/€)")
@@ -809,15 +801,13 @@ with tab_bono:
                 def _lift_num(txt):
                     try: return float(str(txt).replace('×','').strip())
                     except: return 1.0
-                # construir lista con lift/score para elegir el mejor
                 cand_list = []
                 for idx, a2 in enumerate(A2s_b_k, start=1):
                     base6_b = A2s_b_6[idx-1]
                     sc_val_b = score_combo(base6_b, w_blend_b, ALPHA_DIR, MU_PENALTY)
-                    lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
+                    lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_ref_bo, pool_scores_bo)
                     cand_list.append({"Tipo": f"A2 #{idx}", "Números": a2, "Lift": lift_txt_b, "Score": f"{sc_val_b:.2f}", "Pct": pct_txt_b})
                 best_b = max(cand_list, key=lambda r: _lift_num(r['Lift']))
-                # k recomendado
                 k_opt_b = 6 if vol_bo=='Low' or not (use_multi and k_nums>6) else k_nums
                 from math import comb as C
                 simples_opt_b = C(k_opt_b,6) if k_opt_b>6 else 1
@@ -827,7 +817,7 @@ with tab_bono:
                 p_adj_opt_b = p_base_opt_b * lift_val_b
                 ev_no_j_b = ev_proxy(p_adj_opt_b, coste_opt_b)
                 st.write(f"**Números**: {list(best_b['Números'])}")
-                st.write(f"**Lift**: {best_b['Lift']}  ·  **Score**: {best_b['Score']}  ·  **k recomendado**: {k_opt_b}")
+                st.write(f"**Lift**: {best_b['Lift']}  ·  **k recomendado**: {k_opt_b}")
                 st.write(f"**Prob. base**: 1 entre ~{int(round(1/p_base_opt_b)):,}  ·  **Prob. ajustada**: 1 entre ~{int(round(1/p_adj_opt_b)):,}")
                 st.caption(f"EV/€ proxy: {ev_no_j_b:.3e} (independiente de k; k>6 reduce varianza).")
                 if st.button("Confirmar Óptima (Bonoloto)"):
@@ -839,8 +829,8 @@ with tab_bono:
                                           float(round(coste_final_b,2)),
                                           ", ".join(map(str, A1b_k if (use_multi and k_nums>6) else A1b_6)), "-", "-",
                                           int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
-                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_median_bo) if baseline_median_bo else 0.0,
-                                          int(seed_val_b), float(p_base_opt_b), float(p_adj_opt_b), float(ev_no_j_b), float(ev_no_j_b), "opt", "2025-09-02-lift-det-bitacora-v3"])
+                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_ref_bo) if baseline_ref_bo else 0.0,
+                                          int(seed_val_b), float(p_base_opt_b), float(p_adj_opt_b), float(ev_no_j_b), float(ev_no_j_b), "opt", "2025-09-03-wizard-v1"])
                     if ok2: st.success("✅ Óptima confirmada y registrada en Google Sheets (Decisiones).")
                     else:   st.success("✅ Óptima confirmada (no se pudo registrar en Sheets).")
 
@@ -850,8 +840,8 @@ with tab_bono:
             for idx, a2 in enumerate(A2s_b_k, start=1):
                 base6_b = A2s_b_6[idx-1]
                 sc_val_b = score_combo(base6_b, w_blend_b, ALPHA_DIR, MU_PENALTY)
-                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
-                label = f"A2 #{idx} · k={k_nums if (use_multi and k_nums>6) else 6} · Lift {lift_txt_b} · {pct_txt_b}"
+                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_ref_bo, pool_scores_bo)
+                label = f"A2 #{idx} · k={k_nums if (use_multi and k_nums>6) else 6} · Lift {lift_txt_b}"
                 catalogo_b.append((label, {
                     "Tipo": f"A2 #{idx}",
                     "Números": a2,
@@ -870,12 +860,19 @@ with tab_bono:
                 if st.button("Confirmar mi apuesta (Bonoloto)"):
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     coste_bolet_b = chosen_b["Simples"] * float(precio_simple_bono)
-                    entry = {
+
+                    from math import comb as C
+                    k_val_b = int(chosen_b["k"])
+                    p_base_b = C(k_val_b, 6) / C(49, 6)
+                    lift_num_b = _parse_lift_num(chosen_b["Lift"])
+                    p_adj_b = p_base_b * lift_num_b
+
+                    entry_b = {
                         "ts": ts, "juego": "Bonoloto",
                         "fecha_sorteo": next_dt_b.date().strftime("%d/%m/%Y"),
                         "tipo": chosen_b["Tipo"],
                         "numeros": list(chosen_b["Números"]),
-                        "k": int(chosen_b["k"]),
+                        "k": k_val_b,
                         "simples": int(chosen_b["Simples"]),
                         "lift_txt": chosen_b["Lift"],
                         "score": chosen_b["Score"],
@@ -883,35 +880,28 @@ with tab_bono:
                         "joker": False,
                         "coste": float(round(coste_bolet_b,2))
                     }
-                    st.session_state['selecciones'].append(entry)
-                    ok2 = append_decision([ts,"Bonoloto", next_dt_b.strftime("%d/%m/%Y"), chosen_b["Tipo"], int(chosen_b["k"]),
+                    st.session_state['selecciones'].append(entry_b)
+                    ok2 = append_decision([ts,"Bonoloto", next_dt_b.strftime("%d/%m/%Y"), chosen_b["Tipo"], k_val_b,
                                           ", ".join(map(str, chosen_b["Números"])), int(chosen_b["Simples"]), chosen_b["Lift"],
-                                          _parse_lift_num(chosen_b["Lift"]), chosen_b["Score"], chosen_b.get("Pct","—"), _parse_pct_num(chosen_b.get("Pct","")), "NO", float(round(coste_bolet_b,2)),
+                                          _parse_lift_num(chosen_b["Lift"]), chosen_b["Score"], chosen_b.get("Pct","—"), _parse_pct_num(chosen_b.get("Pct","")), "NO",
+                                          float(round(coste_bolet_b,2)),
                                           ", ".join(map(str, A1b_k if (use_multi and k_nums>6) else A1b_6)), "-", "-",
                                           int(WINDOW_DRAWS), float(HALF_LIFE_DAYS), float(DAY_BLEND_ALPHA), float(ALPHA_DIR), float(MU_PENALTY), float(LAMBDA_DIVERSIDAD),
-                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_median_bo) if baseline_median_bo else 0.0,
-                                          int(seed_val_b), float(p_base), float(p_adj), float(ev_proxy(p_adj, coste_bolet_b)), float(ev_proxy(p_adj, coste_bolet_b)), "manual", "2025-09-02-lift-det-bitacora-v3"])
+                                          int(bank_bo), vol_bo, float(precio_simple_bono), 0.0, float(baseline_ref_bo) if baseline_ref_bo else 0.0,
+                                          int(seed_val_b), float(p_base_b), float(p_adj_b), float(ev_proxy(p_adj_b, coste_bolet_b)), float(ev_proxy(p_adj_b, coste_bolet_b)), "manual", "2025-09-03-wizard-v1"])
                     if ok2: st.success("✅ Apuesta confirmada y registrada en Google Sheets (Decisiones).")
                     else:   st.success("✅ Apuesta confirmada (no se pudo registrar en Sheets).")
 
-                    from math import comb as C
-                    def parse_lift_multiplier(lift_txt):
-                        try: return float(str(lift_txt).replace('×','').strip())
-                        except: return 1.0
-                    k_val = entry["k"]
-                    p_base = C(k_val, 6) / C(49, 6)
-                    lift_num = parse_lift_multiplier(entry["lift_txt"])
-                    p_adj = p_base * lift_num
                     st.markdown("### 🧾 Mini-informe")
                     colA, colB, colC = st.columns(3)
                     colA.metric("Juego", "Bonoloto")
-                    colB.metric("k elegido", k_val)
-                    colC.metric("Coste (€)", f"{entry['coste']:.2f}")
-                    st.write(f"**Números**: {entry['numeros']}")
-                    st.write(f"**Fecha sorteo**: {entry['fecha_sorteo']}  ·  **Tipo**: {entry['tipo']}")
-                    st.write(f"**Lift**: {entry['lift_txt']}  ·  **Score**: {entry['score']}  ·  **Percentil**: {entry['pct']}")
-                    st.write(f"**Prob. base** (k={k_val}): 1 entre ~{int(round(1/p_base)):,}")
-                    st.write(f"**Prob. ajustada (Lift)**: 1 entre ~{int(round(1/p_adj)):,}")
+                    colB.metric("k elegido", k_val_b)
+                    colC.metric("Coste (€)", f"{entry_b['coste']:.2f}")
+                    st.write(f"**Números**: {entry_b['numeros']}")
+                    st.write(f"**Fecha sorteo**: {entry_b['fecha_sorteo']}  ·  **Tipo**: {entry_b['tipo']}")
+                    st.write(f"**Lift**: {entry_b['lift_txt']}")
+                    st.write(f"**Prob. base** (k={k_val_b}): 1 entre ~{int(round(1/p_base_b)):,}")
+                    st.write(f"**Prob. ajustada (Lift)**: 1 entre ~{int(round(1/p_adj_b)):,}")
 
         with subB2:
             filas_b = [{
@@ -923,7 +913,7 @@ with tab_bono:
             for i, a2 in enumerate(A2s_b_k, start=1):
                 base6_b = A2s_b_6[i-1]
                 sc_val_b = score_combo(base6_b, w_blend_b, ALPHA_DIR, MU_PENALTY)
-                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_median_bo, pool_scores_bo)
+                lift_txt_b, pct_txt_b = lift_text_only(sc_val_b, baseline_ref_bo, pool_scores_bo)
                 filas_b.append({
                     'Tipo':f'A2-{i}','k': k_nums if (use_multi and k_nums>6) else 6,
                     'Simples': comb(k_nums,6) if (use_multi and k_nums>6) else 1,
@@ -1006,15 +996,14 @@ Te propone **apuestas recomendadas (A2)** que **mejoran** frente a jugar al azar
 - **A1**: boleto ancla del día. Asegura **diversidad**.
 - **A2**: boletos sugeridos por el modelo.
 - **k**: tamaño del boleto (6..8). Si **k>6**, un boleto contiene **varias** combinaciones simples.
-- **Score**: señal de la combinación (log-pesos) – penalización por popularidad. **Cuanto más alto, mejor**.
 - **Lift**: `×ratio` frente al azar (misma estructura). `×1.40` = 1.4 veces mejor que aleatorio.
-- **Pct**: posición frente a una muestra aleatoria (p.e. **top 6% del azar**).
-- **ScoreJ (Primitiva)**: mezcla de señal de la A2 y fuerza del **Reintegro**; si **≥ umbral** ⇒ ⭐ activar Joker.
+- **Prob. base** y **ajustada**: “1 entre X” y “1 entre Y” con la mejora del Lift.
+- **Joker (Primitiva)**: activa si ves ⭐ (umbral adaptativo).
 
 ### Pasos para usarlo
 1. **Fuente del último sorteo** (hoja o manual).  
 2. Pulsa **Calcular**.  
-3. En **Recomendación**, **elige tu A2 final** y confirma. Se guardará en **Bitácora**.
+3. En **🏆 Óptima**, confirma tu apuesta. (Debajo puedes **ampliar cobertura** si quieres).
 
 ### Consejos
 - Bank pequeño ⇒ `k=6`, volatilidad **Low**.  
@@ -1112,3 +1101,47 @@ with tab_log:
             d4.metric("6 aciertos",  f"{rate_6p:.4%}")
         else:
             st.caption("Cuando se publiquen los resultados de esos sorteos en los históricos, verás los aciertos aquí.")
+
+# =========================== 📊 ESTADÍSTICAS ===========================
+with tab_stats:
+    st.subheader('📊 Estadísticas — Opt vs Manual')
+    try:
+        creds = get_gcp_credentials()
+        gc = gspread.authorize(creds)
+        sid = (st.secrets.get('gcp_service_account', {}) or {}).get('sheet_id') or st.secrets.get('sheet_id')
+        if sid:
+            sh = gc.open_by_key(sid)
+            ws = sh.worksheet('Decisiones')
+            rows = ws.get_all_records()
+            df = pd.DataFrame(rows)
+        else:
+            df = pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
+
+    if df.empty:
+        st.info('Aún no hay datos en Decisiones.')
+    else:
+        for c in ['LiftNum','EV_proxy','EV_proxy_Joker','P_base','P_ajustada','Coste(€)']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        if 'Policy' not in df.columns:
+            df['Policy'] = 'manual'
+        def kpi(dfsub):
+            if dfsub.empty:
+                return 0.0, 0.0, 0.0, 0
+            return dfsub['LiftNum'].mean(), dfsub['EV_proxy'].mean(), dfsub['Coste(€)'].sum(), len(dfsub)
+        m_lift, m_ev, m_cost, m_n = kpi(df[df['Policy']=='manual'])
+        o_lift, o_ev, o_cost, o_n = kpi(df[df['Policy']=='opt'])
+        c1,c2,c3 = st.columns(3)
+        c1.metric('Lift medio (manual)', f'{m_lift:.2f}×')
+        c2.metric('Lift medio (óptima)', f'{o_lift:.2f}×')
+        c3.metric('Δ Lift (opt - manual)', f'{(o_lift - m_lift):+.2f}×')
+        d1,d2,d3 = st.columns(3)
+        d1.metric('EV/€ medio (manual)', f'{m_ev:.3e}')
+        d2.metric('EV/€ medio (óptima)', f'{o_ev:.3e}')
+        d3.metric('Gasto total (€)', f'{(m_cost + o_cost):,.2f}')
+        st.markdown('#### Muestras')
+        st.write(f"manual: {m_n}  ·  opt: {o_n}")
+        st.markdown('#### Últimas decisiones')
+        st.dataframe(df.tail(20), use_container_width=True, height=300)
