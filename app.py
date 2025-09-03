@@ -595,7 +595,7 @@ with tab_bono:
     if fuente_b == "Usar último del histórico" and not df_b_full.empty:
         rowb = last_rec_b.iloc[0]
         last_dt_b = pd.to_datetime(rowb["FECHA"])
-        nums_b = [int(rowb["N1"]), int(rowb["N2"]), int[rowb["N3"]), int(rowb["N4"]), int(rowb["N5"]), int(rowb["N6"])]
+        nums_b = [int(rowb["N1"]), int(rowb["N2"]), int(rowb["N3"]), int(rowb["N4"]), int(rowb["N5"]), int(rowb["N6"])]
         comp_b = int(rowb["Complementario"]) if not pd.isna(rowb["Complementario"]) else 18
         rein_b = int(rowb["Reintegro"]) if not pd.isna(rowb["Reintegro"]) else 0
         st.info(f"Usando el último sorteo del histórico (Bonoloto): **{last_dt_b.strftime('%d/%m/%Y')}** · Números: {nums_b} · C: {comp_b} · R: {rein_b}")
