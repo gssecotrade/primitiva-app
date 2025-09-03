@@ -372,7 +372,8 @@ tab_primi, tab_bono, tab_tutorial = st.tabs(["La Primitiva", "Bonoloto", "📘 T
 with tab_primi:
     st.subheader(f"La Primitiva · Recomendador A2 · k={'múltiple' if (use_multi and k_nums>6) else '6'}")
     wizard_pr = st.toggle("🪄 Modo asistido (wizard)", value=True,
-                          help="Guía paso a paso: Fuente → Calcular → 🏆 Óptima → Confirmar")
+                          help="Guía paso a paso: Fuente → Calcular → 🏆 Óptima → Confirmar",
+                          key="wizard_pr")
 
     # Carga histórico una vez para autorrellenar
     df_hist_full = load_sheet_df("sheet_id","worksheet_historico","Historico")
@@ -380,7 +381,8 @@ with tab_primi:
 
     fuente = st.radio("Origen de datos del último sorteo",
                       ["Usar último del histórico", "Introducir manualmente"],
-                      index=0 if not df_hist_full.empty else 1, horizontal=True)
+                      index=0 if not df_hist_full.empty else 1, horizontal=True,
+                      key="src_pr")
 
     if fuente == "Usar último del histórico" and not df_hist_full.empty:
         # Usar el último disponible del Sheet (sin pedir datos)
@@ -426,7 +428,8 @@ with tab_primi:
                     st.info("La fecha ya estaba en el histórico. Se han usado los datos existentes y no se añadirá nada.")
                 else:
                     last_dt = pd.to_datetime(last_date)
-
+# ==== PARTE 2/4 – FIN ====
+# ==== PARTE 3/4 ====
     if 'do_calc' in locals() and do_calc:
         if len(set(nums))!=6:
             st.error("Los 6 números deben ser distintos.")
@@ -499,7 +502,6 @@ with tab_primi:
 
         best6 = list(pool[0]) if pool else []
         zA2,_,_ = zscore_combo(best6, w_blend) if best6 else (0.0,0.0,0.0)
-        # n_sugerido = pick_n(zA2, bank_pr, vol_pr, THRESH_N)  # para lista larga
         n_sugerido = 3  # mantenemos 3 alternativas (óptima + 2 ampliaciones)
 
         # Selección greedily
@@ -520,112 +522,14 @@ with tab_primi:
                 "scoreJ": scJ,
                 "joker_reco": (use_joker and scJ>=joker_thr)
             })
-# ==== PARTE 2/4 – FIN ====
-# ==== PARTE 3/4 ====
-        # ÓPTIMA = mayor lift (si empate, mayor score)
-        if filas:
-            filas_sorted = sorted(filas, key=lambda r: (r["lift"], r["score"]), reverse=True)
-            opt = filas_sorted[0]
-        else:
-            opt = None
 
-        # Coste y probabilidades para k recomendado
-        k_reco = (k_nums if (use_multi and k_nums>6) else 6)
-        p_base = prob_base_k(k_reco)
-        lift_opt = opt["lift"] if opt else 1.0
-        p_adj = p_base * lift_opt
-        costo_boletos = comb(k_reco,6) * float(precio_simple_pr)
-        costo_joker = float(precio_joker) if (opt and opt["joker_reco"]) else 0.0
-        coste_total = costo_boletos + costo_joker
-
-        # --------- UI (pestañas internas) ---------
-        subtab1, subtab2, subtab3, subtab4 = st.tabs(["🏆 Óptima", "Apuestas", "Métricas", "Ventana de referencia"])
-
-        with subtab1:
-            st.metric("Boletos (A1 + A2 jugadas)", 1)  # estrategia óptima = 1
-            st.metric("Coste estimado (€)", f"{coste_total:,.2f}")
-            st.metric("Confianza (señal)", conf_label(zA2))
-            if opt:
-                st.success(f"**Apuesta Óptima (EV/€)**: {opt['base6'] if k_reco==6 else expand_to_k(opt['base6'], w_blend, k_reco)}")
-                st.write(f"**Lift vs azar:** ×{lift_opt:.2f}")
-                st.write(f"**Prob. base (k={k_reco})**: 1 entre {int(round(1/(p_base+1e-12))):,}")
-                st.write(f"**Prob. ajustada**: 1 entre {int(round(1/(p_adj+1e-12))):,}")
-                if opt["joker_reco"]:
-                    st.info(f"⭐ **Joker recomendado** (ScoreJ={opt['scoreJ']:.2f}) · Coste +{precio_joker:.2f}€")
-                else:
-                    st.caption(f"Joker no recomendado (ScoreJ={opt['scoreJ']:.2f}, umbral={joker_thr:.2f}).")
-                # Confirmación / Bitácora
-                if st.button("✅ Marcar esta apuesta como jugada (Bitácora)"):
-                    ok = bitacora_append({
-                        "juego":"Primitiva",
-                        "fecha_sorteo": next_dt,
-                        "a1": A1_k,
-                        "a2": opt["base6"],
-                        "k": k_reco,
-                        "joker": opt["joker_reco"],
-                        "coste": coste_total,
-                        "score": float(opt["score"]),
-                        "lift": float(lift_opt),
-                        "p_base": float(p_base),
-                        "p_adj": float(p_adj),
-                        "policy": f"use_multi={use_multi};k={k_reco};thrJ={joker_thr};win={WINDOW_DRAWS};hl={HALF_LIFE_DAYS};alpha={DAY_BLEND_ALPHA}",
-                        "decision":"aceptada"
-                    })
-                    st.success("Guardado en Bitácora." if ok else "No se pudo escribir en Bitácora. Revisa credenciales/hoja.")
-
-        with subtab2:
-            # Tabla A1 + A2s
-            rows = []
-            rows.append({
-                "Tipo":"A1",
-                "k": k_reco,
-                "Simples": comb(k_reco,6),
-                "Números": ", ".join(map(str, A1_k if k_reco>6 else A1_6)),
-                "Joker": "—",
-                "ScoreJ": "—",
-                "Score": "—",
-                "Lift": "—"
-            })
-            for r in filas:
-                nums = r["base6"] if k_reco==6 else expand_to_k(r["base6"], w_blend, k_reco)
-                rows.append({
-                    "Tipo": r["tipo"],
-                    "k": k_reco,
-                    "Simples": comb(k_reco,6),
-                    "Números": ", ".join(map(str, nums)),
-                    "Joker": "⭐" if r["joker_reco"] else "—",
-                    "ScoreJ": f"{r['scoreJ']:.2f}",
-                    "Score": f"{r['score']:.2f}",
-                    "Lift": f"×{r['lift']:.2f}"
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, height=320)
-
-        with subtab3:
-            st.markdown("**Señal media A2 (z-score):** {:.3f}".format(zA2))
-            base_w = np.array([w_blend.get(i,0.0) for i in range(1,50)])
-            p_norm = base_w / (base_w.sum() if base_w.sum()>0 else 1.0)
-            p_top6 = np.sort(p_norm)[-6:].mean()
-            st.markdown(f"**Intensidad media de pesos (top-6):** {p_top6:.3%}")
-            st.caption("Las métricas son orientativas; la lotería es aleatoria (independiente por sorteo).")
-
-        with subtab4:
-            st.dataframe(base[["FECHA","N1","N2","N3","N4","N5","N6","Complementario","Reintegro"]].tail(min(24, len(base))),
-                         use_container_width=True, height=280)
-
-        # Guardar histórico si procede (solo si era nuevo)
-        if fuente == "Introducir manualmente" and save_hist:
-            ok = append_row_if_new("sheet_id","worksheet_historico","Historico", {
-                "FECHA":last_dt, "N1":nums[0], "N2":nums[1], "N3":nums[2], "N4":nums[3], "N5":nums[4], "N6":nums[5],
-                "Complementario": comp, "Reintegro": rein
-            })
-            if ok: st.success("✅ Histórico (Primitiva) actualizado.")
-            else:  st.info("ℹ️ No se añadió al histórico (duplicado o acceso restringido).")
-
+        # -------- BONOLOTO --------
 # =========================== BONOLOTO ===========================
 with tab_bono:
     st.subheader(f"Bonoloto · Recomendador A2 · k={'múltiple' if (use_multi and k_nums>6) else '6'}")
     wizard_bo = st.toggle("🪄 Modo asistido (wizard)", value=True,
-                          help="Guía paso a paso: Fuente → Calcular → 🏆 Óptima → Confirmar")
+                          help="Guía paso a paso: Fuente → Calcular → 🏆 Óptima → Confirmar",
+                          key="wizard_bo")
 
     # Carga histórico una vez para autorrellenar
     df_b_full = load_sheet_df("sheet_id_bono","worksheet_historico_bono","HistoricoBono")
